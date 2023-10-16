@@ -578,11 +578,14 @@ func (r *raft) send(m pb.Message) {
 		// we err on the side of safety and omit a `&& !m.Reject` condition
 		// above.
 		r.msgsAfterAppend = append(r.msgsAfterAppend, m)
+		traceSendMessage(r, &m)
+
 	} else {
 		if m.To == r.id {
 			r.logger.Panicf("message should not be self-addressed when sending %s", m.Type)
 		}
 		r.msgs = append(r.msgs, m)
+		traceSendMessage(r, &m)
 	}
 }
 
@@ -753,6 +756,8 @@ func (r *raft) appliedSnap(snap *pb.Snapshot) {
 // the commit index changed (in which case the caller should call
 // r.bcastAppend).
 func (r *raft) maybeCommit() bool {
+	traceNodeEvent(RsmCommit, r)
+
 	mci := r.prs.Committed()
 	return r.raftLog.maybeCommit(mci, r.Term)
 }
@@ -868,6 +873,8 @@ func (r *raft) becomeFollower(term uint64, lead uint64) {
 	r.lead = lead
 	r.state = StateFollower
 	r.logger.Infof("%x became follower at term %d", r.id, r.Term)
+
+	traceNodeEvent(RsmBecomeFollower, r)
 }
 
 func (r *raft) becomeCandidate() {
@@ -875,12 +882,15 @@ func (r *raft) becomeCandidate() {
 	if r.state == StateLeader {
 		panic("invalid transition [leader -> candidate]")
 	}
+
 	r.step = stepCandidate
 	r.reset(r.Term + 1)
 	r.tick = r.tickElection
 	r.Vote = r.id
 	r.state = StateCandidate
 	r.logger.Infof("%x became candidate at term %d", r.id, r.Term)
+
+	traceNodeEvent(RsmBecomeCandidate, r)
 }
 
 func (r *raft) becomePreCandidate() {
@@ -904,6 +914,7 @@ func (r *raft) becomeLeader() {
 	if r.state == StateFollower {
 		panic("invalid transition [follower -> leader]")
 	}
+
 	r.step = stepLeader
 	r.reset(r.Term)
 	r.tick = r.tickHeartbeat
@@ -925,6 +936,8 @@ func (r *raft) becomeLeader() {
 	// pending log entries, and scanning the entire tail of the log
 	// could be expensive.
 	r.pendingConfIndex = r.raftLog.lastIndex()
+
+	traceNodeEvent(RsmBecomeLeader, r)
 
 	emptyEnt := pb.Entry{Data: nil}
 	if !r.appendEntry(emptyEnt) {
@@ -1049,6 +1062,8 @@ func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int, rejected 
 }
 
 func (r *raft) Step(m pb.Message) error {
+	traceReceiveMessage(r, &m)
+
 	// Handle the message term, which may result in our stepping down to a follower.
 	switch {
 	case m.Term == 0:
@@ -1273,6 +1288,8 @@ func stepLeader(r *raft, m pb.Message) error {
 				cc = ccc
 			}
 			if cc != nil {
+				traceChangeConfEvent(cc, r)
+
 				alreadyPending := r.pendingConfIndex > r.raftLog.applied
 				alreadyJoint := len(r.prs.Config.Voters[1]) > 0
 				wantsLeaveJoint := len(cc.AsV2().Changes) == 0
@@ -1292,6 +1309,8 @@ func stepLeader(r *raft, m pb.Message) error {
 				} else {
 					r.pendingConfIndex = r.raftLog.lastIndex() + uint64(i) + 1
 				}
+			} else {
+				traceNodeEvent(RsmReplicate, r)
 			}
 		}
 
@@ -1915,6 +1934,8 @@ func (r *raft) applyConfChange(cc pb.ConfChangeV2) pb.ConfState {
 //
 // The inputs usually result from restoring a ConfState or applying a ConfChange.
 func (r *raft) switchToConfig(cfg tracker.Config, prs tracker.ProgressMap) pb.ConfState {
+	traceConfChangeEvent(cfg, r)
+
 	r.prs.Config = cfg
 	r.prs.Progress = prs
 

@@ -7,14 +7,10 @@
 \* This work is licensed under the Creative Commons Attribution-4.0
 \* International License https://creativecommons.org/licenses/by/4.0/
 
-EXTENDS Naturals, Integers, TypedBags, FiniteSets, Sequences, SequencesExt, TLC
+EXTENDS Naturals, Integers, Bags, FiniteSets, Sequences, SequencesExt, FiniteSetsExt, TLC
 
 \* The initial and global set of server IDs.
 CONSTANTS InitServer, Server
-
-\* The number of rounds to catch new servers up for.
-\* Must be >= 1.
-CONSTANT NumRounds
 
 \* Log metadata to distinguish values from configuration changes.
 CONSTANT ValueEntry, ConfigEntry
@@ -28,11 +24,6 @@ MaxTerms == MaxTimeouts + 1
 MaxMembershipChanges == 3
 MaxTriedMembershipChanges == MaxMembershipChanges + 1
 MaxInFlightMessages == LET card == Cardinality(Server) IN 2 * card * card
-
-\* The set of requests that can go into the log
-CONSTANTS 
-    \* @type: Set(Int);
-    Value
 
 \* Server states.
 CONSTANTS 
@@ -57,12 +48,7 @@ CONSTANTS
     \* @type: Str;
     AppendEntriesRequest,
     \* @type: Str;
-    AppendEntriesResponse,
-
-    \* Membership changes
-    CatchupRequest,
-    CatchupResponse,
-    CheckOldConfig
+    AppendEntriesResponse
 
 -----
 
@@ -186,11 +172,18 @@ VARIABLE
 \* @type: Seq(Int -> (Int -> Int));
 leaderVars == <<nextIndex, matchIndex>>
 
+VARIABLE 
+    pendingConfChangeIndex
+VARIABLE 
+    config
+confVars == <<pendingConfChangeIndex, config>>
+
+
 \* End of per server variables.
 ----
 
 \* All variables; used for stuttering (asserting state hasn't changed).
-vars == <<messages, serverVars, candidateVars, leaderVars, logVars>>
+vars == <<messages, serverVars, candidateVars, leaderVars, logVars, confVars>>
 systemState == [
     messages |-> messages,
     \* serverVars
@@ -205,7 +198,10 @@ systemState == [
     matchIndex |-> matchIndex,
     \* logVars
     log |-> log,
-    commitIndex |-> commitIndex
+    commitIndex |-> commitIndex,
+    \* confVars
+    config |->config,
+    pendingConfChangeIndex |-> pendingConfChangeIndex
 ]
 
 
@@ -214,7 +210,7 @@ systemState == [
 
 \* The set of all quorums. This just calculates simple majorities, but the only
 \* important property is that every quorum overlaps with every other.
-Quorum(config) == {i \in SUBSET(config) : Cardinality(i) * 2 > Cardinality(config)}
+Quorum(c) == {i \in SUBSET(c) : Cardinality(i) * 2 > Cardinality(c)}
 
 \* The term of the last entry in a log, or 0 if the log is empty.
 \* @type: LOGT => Int;
@@ -246,21 +242,9 @@ WrapMsg(m) ==
 \* Add a message to the bag of messages.
 SendDirect(m) == 
     LET msgAction == [action |-> "Send", executedOn |-> m.msource, msg |-> m]
-        membershipAction == 
-        IF m.mtype = CatchupRequest
-            THEN [action |-> "TryAddServer", executedOn |-> m.msource, added |-> m.mdest]
-        ELSE IF m.mtype = CheckOldConfig
-            THEN [action |-> "TryRemoveServer", executedOn |-> m.msource, removed |-> m.mserver]
-        ELSE << >>
     IN
     /\ messages'    = WithMessage(m, messages)
-    /\ history' =
-        IF membershipAction = << >>
-        THEN [history EXCEPT !["global"] = Append(history["global"], msgAction)]
-        ELSE 
-        [history EXCEPT 
-            !["hadNumTriedMembershipChanges"] = history["hadNumTriedMembershipChanges"] + 1,
-            !["global"] = Append(Append(history["global"], membershipAction), msgAction)]
+    /\ history'     = [history EXCEPT !["global"] = Append(history["global"], msgAction)]
 
 \* @type: [msource: Int] => Bool;
 SendWrapped(m) == 
@@ -281,13 +265,6 @@ DiscardDirect(m) ==
     LET action == [action |-> "Receive", executedOn |-> m.mdest, msg |-> m] IN
     /\ messages'    = WithoutMessage(m, messages)
     /\ history'     = [history EXCEPT !["global"] = Append(history["global"], action)]
-
-DiscardDirectWithMembershipChange(m, extraAction) ==
-    LET action == [action |-> "Receive", executedOn |-> m.mdest, msg |-> m] IN
-    /\ messages'    = WithoutMessage(m, messages)
-    /\ history'     = [history EXCEPT
-            !["hadNumMembershipChanges"] = history["hadNumMembershipChanges"] + 1,
-            !["global"] = Append(Append(history["global"], action), extraAction)]
 
 \* processing a message.
 \* @type: [mdest: Int] => Bool;
@@ -323,7 +300,6 @@ ReplyWrapped(response, request) ==
  Send(m) == SendDirect(m)
  Reply(response, request) == ReplyDirect(response, request)
  Discard(m) == DiscardDirect(m)
- DiscardWithMembershipChange(m, extraAction) == DiscardDirectWithMembershipChange(m, extraAction)
  SendWithoutHistory(m) == SendWithoutHistoryDirect(m)
  DiscardWithoutHistory(m) == DiscardWithoutHistoryDirect(m) 
 
@@ -333,31 +309,19 @@ ReplyWrapped(response, request) ==
 \*SendWithoutHistory(m) == SendWithoutHistoryWrapped(m)
 \*DiscardWithoutHistory(m) == DiscardWithoutHistoryWrapped(m) 
 
-\* Return the minimum value from a set, or undefined if the set is empty.
-\* @type: Set(Int) => Int;
-Min(s) == CHOOSE x \in s : \A y \in s : x <= y
-\* Return the maximum value from a set, or undefined if the set is empty.
-\* @type: Set(Int) => Int;
-Max(s) == CHOOSE x \in s : \A y \in s : x >= y
-
 MaxOrZero(s) == IF s = {} THEN 0 ELSE Max(s)
 
-\* Return the index of the latest configuration in server i's log.
-GetHistoricalMaxConfigIndex(i, s) ==
-    LET configIndexes == { index \in 1..Len(s.log[i]) : s.log[i][index].type = ConfigEntry }
-    IN IF configIndexes = {} THEN 0
-       ELSE Max(configIndexes)
+GetJointConfig(i) == 
+    config[i]
 
-GetMaxConfigIndex(i) == GetHistoricalMaxConfigIndex(i, systemState)
+GetConfig(i) == 
+    GetJointConfig(i)[1]
 
-\* Return the latest configuration in server i's log.
-GetHistoricalConfig(i, s) ==
-  LET maxConfigIndex == GetHistoricalMaxConfigIndex(i, s) IN
-  IF maxConfigIndex = 0 THEN InitServer
-  ELSE s.log[i][maxConfigIndex].value
+GetOutgoingConfig(i) ==
+    GetJointConfig(i)[2]
 
-
-GetConfig(i) == GetHistoricalConfig(i, systemState)
+IsJointConfig(i) ==
+    /\ config[i][2] # {}
 
 CurrentLeaders == {i \in Server : state[i] = Leader}
 
@@ -369,13 +333,12 @@ InitServerVars == /\ currentTerm = [i \in Server |-> 1]
                   /\ votedFor    = [i \in Server |-> Nil]
 InitCandidateVars == /\ votesResponded = [i \in Server |-> {}]
                      /\ votesGranted   = [i \in Server |-> {}]
-\* The values nextIndex[i][i] and matchIndex[i][i] are never read, since the
-\* leader does not send itself messages. It's still easier to include these
-\* in the functions.
 InitLeaderVars == /\ nextIndex  = [i \in Server |-> [j \in Server |-> 1]]
                   /\ matchIndex = [i \in Server |-> [j \in Server |-> 0]]
 InitLogVars == /\ log          = [i \in Server |-> << >>]
                /\ commitIndex  = [i \in Server |-> 0]
+InitConfVars == /\ pendingConfChangeIndex = [i \in Server |-> 0]
+                /\ config = [ i \in Server |-> <<Server, {}>> ]
 InitHistory == [
     server |-> [i \in Server |-> [restarted |-> 0, timeout |-> 0]],
     global |-> << >>,
@@ -391,6 +354,7 @@ Init == /\ messages = EmptyBag
         /\ InitCandidateVars
         /\ InitLeaderVars
         /\ InitLogVars
+        /\ InitConfVars
 
 ----
 \* Define state transitions
@@ -404,11 +368,10 @@ Restart(i) ==
     /\ votesGranted'   = [votesGranted EXCEPT ![i] = {}]
     /\ nextIndex'      = [nextIndex EXCEPT ![i] = [j \in Server |-> 1]]
     /\ matchIndex'     = [matchIndex EXCEPT ![i] = [j \in Server |-> 0]]
-    /\ commitIndex'    = [commitIndex EXCEPT ![i] = 0]
     /\ history'        = [history EXCEPT
                                 !["server"] [i] ["restarted"] = history["server"][i]["restarted"] + 1,
                                 !["global"] = Append(history["global"], [action |-> "Restart", executedOn |-> i])]
-    /\ UNCHANGED <<messages, currentTerm, votedFor, log>>
+    /\ UNCHANGED <<messages, currentTerm, votedFor, logVars, confVars>>
 
 \* Server i times out and starts a new election.
 \* @type: Int => Bool;
@@ -416,56 +379,71 @@ Timeout(i) == /\ state[i] \in {Follower, Candidate}
               /\ i \in GetConfig(i)
               /\ state' = [state EXCEPT ![i] = Candidate]
               /\ currentTerm' = [currentTerm EXCEPT ![i] = currentTerm[i] + 1]
-              \* Most implementations would probably just set the local vote
-              \* atomically, but messaging localhost for it is weaker.
-              /\ votedFor' = [votedFor EXCEPT ![i] = Nil]
+              /\ votedFor' = [votedFor EXCEPT ![i] = i]
               /\ votesResponded' = [votesResponded EXCEPT ![i] = {}]
               /\ votesGranted'   = [votesGranted EXCEPT ![i] = {}]
               /\ history'        = [history EXCEPT 
                                         !["server"] [i] ["timeout"] = history["server"][i]["timeout"] + 1,
                                         !["global"] = Append(history["global"], [action |-> "Timeout", executedOn |-> i])]
-              /\ UNCHANGED <<messages, leaderVars, logVars>>
+              /\ UNCHANGED <<messages, leaderVars, logVars, confVars>>
 
 \* Candidate i sends j a RequestVote request.
 \* @type: (Int, Int) => Bool;
 RequestVote(i, j) ==
     /\ state[i] = Candidate
     /\ j \in (GetConfig(i) \ votesResponded[i])
-    /\ Send([mtype         |-> RequestVoteRequest,
-             mterm         |-> currentTerm[i],
-             mlastLogTerm  |-> LastTerm(log[i]),
-             mlastLogIndex |-> Len(log[i]),
-             msource       |-> i,
-             mdest         |-> j])
-    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars>>
+    /\ IF i # j 
+        THEN Send([mtype            |-> RequestVoteRequest,
+                   mterm            |-> currentTerm[i],
+                   mlastLogTerm     |-> LastTerm(log[i]),
+                   mlastLogIndex    |-> Len(log[i]),
+                   msource          |-> i,
+                   mdest            |-> j])
+        ELSE Send([mtype            |-> RequestVoteResponse,
+                   mterm            |-> currentTerm[i],
+                   mvoteGranted     |-> TRUE,
+                   mlog             |-> log[i],
+                   msource          |-> i,
+                   mdest            |-> i])
+    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars, confVars>>
 
-\* Leader i sends j an AppendEntries request containing up to 1 entry.
-\* While implementations may want to send more than 1 at a time, this spec uses
-\* just 1 because it minimizes atomic regions without loss of generality.
+EntriesToAppend == 1
+
+\* Leader i sends j an AppendEntries request containing specific # of entries
 \* @type: (Int, Int) => Bool;
 AppendEntries(i, j) ==
-    /\ i /= j
     /\ state[i] = Leader
     /\ j \in GetConfig(i)
-    /\ LET prevLogIndex == nextIndex[i][j] - 1
-           \* The following upper bound on prevLogIndex is unnecessary
-           \* but makes verification substantially simpler.
-           prevLogTerm == IF prevLogIndex > 0 /\ prevLogIndex <= Len(log[i]) THEN
-                              log[i][prevLogIndex].term
-                          ELSE
-                              0
-           \* Send up to 1 entry, constrained by the end of the log.
-           lastEntry == Min({Len(log[i]), nextIndex[i][j]})
-           entries == SubSeq(log[i], nextIndex[i][j], lastEntry)
-       IN Send([mtype          |-> AppendEntriesRequest,
-                mterm          |-> currentTerm[i],
-                mprevLogIndex  |-> prevLogIndex,
-                mprevLogTerm   |-> prevLogTerm,
-                mentries       |-> entries,
-                mcommitIndex   |-> Min({commitIndex[i], lastEntry}),
-                msource        |-> i,
-                mdest          |-> j])
-    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars>>
+    /\ IF i /= j THEN
+        /\ LET prevLogIndex == nextIndex[i][j] - 1
+            \* The following upper bound on prevLogIndex is unnecessary
+            \* but makes verification substantially simpler.
+            prevLogTerm == IF prevLogIndex > 0 /\ prevLogIndex <= Len(log[i]) THEN
+                                log[i][prevLogIndex].term
+                            ELSE
+                                0
+            \* Send specific # of entries
+            lastEntry == Min({Len(log[i]), nextIndex[i][j] - 1 + EntriesToAppend})
+            entries == SubSeq(log[i], nextIndex[i][j], lastEntry)
+            IN /\ Send([mtype          |-> AppendEntriesRequest,
+                        mterm          |-> currentTerm[i],
+                        mprevLogIndex  |-> prevLogIndex,
+                        mprevLogTerm   |-> prevLogTerm,
+                        mentries       |-> entries,
+                        mcommitIndex   |-> Min({commitIndex[i], lastEntry}),
+                        msource        |-> i,
+                        mdest          |-> j])
+                \* etcd optimize append entries pipeline by updating next index immediately after sending
+               /\ nextIndex' = [nextIndex EXCEPT ![i][j] =  lastEntry + 1]
+               /\ UNCHANGED <<serverVars, candidateVars, matchIndex, logVars, confVars>> 
+       ELSE \* etcd leader sends MsgAppResp to itself immediately after appending log entry 
+        /\ Send([mtype           |-> AppendEntriesResponse,
+                 mterm           |-> currentTerm[i],
+                 msuccess        |-> TRUE,
+                 mmatchIndex     |-> Len(log[i]),
+                 msource         |-> i,
+                 mdest           |-> i])
+        /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars, confVars>>
 
 \* Candidate i transitions to leader.
 \* @type: Int => Bool;
@@ -476,25 +454,31 @@ BecomeLeader(i) ==
     /\ nextIndex'  = [nextIndex EXCEPT ![i] =
                          [j \in Server |-> Len(log[i]) + 1]]
     /\ matchIndex' = [matchIndex EXCEPT ![i] =
-                         [j \in Server |-> 0]]
+                         [j \in Server |-> IF j = i THEN Len(log[i]) ELSE 0]]
+    /\ log' = [log EXCEPT ![i] = Append(@, [term  |-> currentTerm[i]]) ]
     /\ history'    = [history EXCEPT 
                             !["hadNumLeaders"] = history["hadNumLeaders"] + 1,
                             !["global"] = Append(history["global"], 
                                 [action |-> "BecomeLeader", executedOn |-> i, leaders |-> (CurrentLeaders \cup {i})])]
-    /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, logVars>>
+    /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, commitIndex, confVars>>
     
+Replicate(i, v, t) == 
+    /\ t \in {ValueEntry, ConfigEntry}
+    /\ state[i] = Leader
+    /\ LET historyKey == IF t = ValueEntry THEN "hadNumClientRequests" ELSE "hadNumMembershipChanges"
+           entry == [term  |-> currentTerm[i],
+                     type  |-> t,
+                     seq   |-> history[historyKey],
+                     value |-> v]
+           newLog == Append(log[i], entry)
+       IN  /\ log' = [log EXCEPT ![i] = newLog]
+           /\ history'    = [history EXCEPT ![historyKey] = @ + 1]
+    /\ UNCHANGED <<messages, serverVars, candidateVars, leaderVars, commitIndex, confVars>>
+
 \* Leader i receives a client request to add v to the log.
 \* @type: (Int, Int) => Bool;
 ClientRequest(i, v) ==
-    /\ state[i] = Leader
-    /\ LET entry == [term  |-> currentTerm[i],
-                     type  |-> ValueEntry,
-                     value |-> v]
-           newLog == Append(log[i], entry)
-       IN  log' = [log EXCEPT ![i] = newLog]
-    /\ history'    = [history EXCEPT !["hadNumClientRequests"] = history["hadNumClientRequests"] + 1]
-    /\ UNCHANGED <<messages, serverVars, candidateVars,
-                   leaderVars, commitIndex>>
+    Replicate(i, v, ValueEntry)
 
 \* Leader i advances its commitIndex.
 \* This is done as a separate step from handling AppendEntries responses,
@@ -520,54 +504,43 @@ AdvanceCommitIndex(i) ==
               ELSE
                   commitIndex[i]
             committed == newCommitIndex > commitIndex[i]
-            committedMembershipChange ==
-                /\ committed
-                /\ log[i][newCommitIndex].type = ConfigEntry
-                \* The newly commited entry actually changes the configuration, i.e. is not the same config commited again
-                /\ log[i][newCommitIndex].value /= 
-                    GetHistoricalConfig(i, [log |-> [log EXCEPT ![i] = SubSeq(log[i], 1, newCommitIndex - 1)]])
        IN
         /\ commitIndex' = [commitIndex EXCEPT ![i] = newCommitIndex]
-        /\ IF committedMembershipChange THEN 
-            history' = [history EXCEPT
-                !["global"] = Append(history["global"],
-                    [action |-> "CommitMembershipChange", executedOn |-> i, config |-> log[i][newCommitIndex].value])]
-            ELSE IF committed THEN
+        /\ IF committed THEN
              history' = [history EXCEPT
                 !["global"] = Append(history["global"], [action |-> "CommitEntry", executedOn |-> i, entry |-> log[i][newCommitIndex]])]
             ELSE UNCHANGED <<history>>
-    /\ UNCHANGED <<messages, serverVars, candidateVars, leaderVars, log>>
+    /\ UNCHANGED <<messages, serverVars, candidateVars, leaderVars, log, confVars>>
 
+    
 \* Leader i adds a new server j to the cluster.
 AddNewServer(i, j) ==
     /\ state[i] = Leader
     /\ j \notin GetConfig(i)
+    /\ pendingConfChangeIndex[i] = 0
+    /\ ~IsJointConfig(i)
+    /\ Replicate(i, [newconf |-> GetConfig(i) \union {j}], ConfigEntry)
     /\ currentTerm' = [currentTerm EXCEPT ![j] = 1]
     /\ votedFor' = [votedFor EXCEPT ![j] = Nil]
-    /\ Send([mtype |-> CatchupRequest,
-            mterm |-> currentTerm[i],
-            mlogLen |-> matchIndex[i][j],
-            mentries |-> SubSeq(log[i], nextIndex[i][j], commitIndex[i]),
-            mcommitIndex |-> commitIndex[i],
-            msource |-> i,
-            mdest |-> j,
-            mrounds |-> NumRounds])
-    /\ UNCHANGED <<state, leaderVars, logVars, candidateVars>>
+    /\ pendingConfChangeIndex' = [pendingConfChangeIndex EXCEPT ![i]=Len(log[i])]
 
 \* Leader i removes a server j (possibly itself) from the cluster.
 DeleteServer(i, j) ==
     /\ state[i] = Leader
     /\ state[j] \in {Follower, Candidate}
     /\ j \in GetConfig(i)
-    /\ j /= i \* TODO: A leader cannot remove itself.
-    /\ Send([mtype |-> CheckOldConfig,
-            mterm |-> currentTerm[i],
-            madd |-> FALSE,
-            mserver |-> j,
-            msource |-> i,
-            mdest |-> i])
-    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars>>
+    /\ pendingConfChangeIndex[i] = 0
+    /\ ~IsJointConfig(i)
+    /\ Replicate(i, [newconf |-> GetConfig(i) \ {j}], ConfigEntry)
+    /\ pendingConfChangeIndex' = [pendingConfChangeIndex EXCEPT ![i]=Len(log[i])]
 
+ApplyConfChange(i) ==
+    /\ pendingConfChangeIndex[i] > 0
+    /\ pendingConfChangeIndex[i] <= commitIndex[i]
+    /\ ~IsJointConfig(i)
+    /\ config' = [config EXCEPT ![i]= << log[i][pendingConfChangeIndex[i]].value.newconf, {} >>]
+    /\ pendingConfChangeIndex' = [pendingConfChangeIndex EXCEPT ![i] = 0]
+    
 ----
 \* Message handlers
 \* i = recipient, j = sender, m = message
@@ -594,7 +567,7 @@ HandleRequestVoteRequest(i, j, m) ==
                  msource      |-> i,
                  mdest        |-> j],
                  m)
-       /\ UNCHANGED <<state, currentTerm, candidateVars, leaderVars, logVars>>
+       /\ UNCHANGED <<state, currentTerm, candidateVars, leaderVars, logVars, confVars>>
 
 \* Server i receives a RequestVote response from server j with
 \* m.mterm = currentTerm[i].
@@ -611,7 +584,7 @@ HandleRequestVoteResponse(i, j, m) ==
        \/ /\ ~m.mvoteGranted
           /\ UNCHANGED <<votesGranted>>
     /\ Discard(m)
-    /\ UNCHANGED <<serverVars, votedFor, leaderVars, logVars>>
+    /\ UNCHANGED <<serverVars, votedFor, leaderVars, logVars, confVars>>
 
 \* @type: (Int, Int, AEREQT, Bool) => Bool;
 RejectAppendEntriesRequest(i, j, m, logOk) ==
@@ -626,49 +599,49 @@ RejectAppendEntriesRequest(i, j, m, logOk) ==
               msource         |-> i,
               mdest           |-> j],
               m)
-    /\ UNCHANGED <<serverVars, logVars>>
+    /\ UNCHANGED <<serverVars, logVars, confVars>>
 
 \* @type: (Int, MSG) => Bool;
 ReturnToFollowerState(i, m) ==
     /\ m.mterm = currentTerm[i]
     /\ state[i] = Candidate
     /\ state' = [state EXCEPT ![i] = Follower]
-    /\ UNCHANGED <<currentTerm, votedFor, logVars, messages, history>>
+    /\ UNCHANGED <<currentTerm, votedFor, logVars, messages, history, confVars>> 
+
+HasNoConflict(i, index, ents) ==
+    /\ index <= Len(log[i]) + 1
+    /\ \A k \in 1..Len(ents): index + k - 1 <= Len(log[i]) => log[i][index+k-1].term = ents[k].term
 
 \* @type: (Int, Int, Int, AEREQT) => Bool;
 AppendEntriesAlreadyDone(i, j, index, m) ==
-    /\ \/ m.mentries = << >>
+    /\ \/ index <= commitIndex[i]
+       \/ m.mentries = << >>
        \/ /\ m.mentries /= << >>
-          /\ Len(log[i]) >= index
-          /\ log[i][index].term = m.mentries[1].term
-                          \* This could make our commitIndex decrease (for
-                          \* example if we process an old, duplicated request),
-                          \* but that doesn't really affect anything.
-    /\ commitIndex' = [commitIndex EXCEPT ![i] = m.mcommitIndex]
+          /\ m.mprevLogIndex + Len(m.mentries) <= Len(log[i])
+          /\ HasNoConflict(i, index, m.mentries)
+    /\ commitIndex' = [commitIndex EXCEPT ![i] = IF index <= commitIndex[i] THEN @ ELSE Min({m.mcommitIndex, m.mprevLogIndex+Len(m.mentries)})]
     /\ Reply([mtype           |-> AppendEntriesResponse,
-              mterm           |-> currentTerm[i],
-              msuccess        |-> TRUE,
-              mmatchIndex     |-> m.mprevLogIndex + Len(m.mentries),
-              msource         |-> i,
-              mdest           |-> j],
-              m)
-    /\ UNCHANGED <<serverVars, log>>
+                mterm           |-> currentTerm[i],
+                msuccess        |-> TRUE,
+                mmatchIndex     |-> IF index <= commitIndex[i] THEN commitIndex[i] ELSE m.mprevLogIndex+Len(m.mentries),
+                msource         |-> i,
+                mdest           |-> j],
+                m)
+    /\ UNCHANGED <<serverVars, log, confVars>>
 
 \* @type: (Int, Int, AEREQT) => Bool;
 ConflictAppendEntriesRequest(i, index, m) ==
     /\ m.mentries /= << >>
-    /\ Len(log[i]) >= index
-    /\ log[i][index].term /= m.mentries[1].term
-    \* /\ LET new == [index2 \in 1..(Len(log[i]) - 1) |-> log[i][index2]]
-    /\ LET new == SubSeq(log[i], 1, Len(log[i]) - 1)
-       IN log' = [log EXCEPT ![i] = new]
+    /\ index > commitIndex[i]
+    /\ ~HasNoConflict(i, index, m.mentries)
+    /\ log' = [log EXCEPT ![i] = SubSeq(log[i], 1, Len(log[i]) - 1)]
     /\ UNCHANGED <<serverVars, commitIndex, messages, history>>
 
 \* @type: (Int, AEREQT) => Bool;
-NoConflictAppendEntriesRequest(i, m) ==
+NoConflictAppendEntriesRequest(i, index, m) ==
     /\ m.mentries /= << >>
-    /\ Len(log[i]) = m.mprevLogIndex
-    /\ log' = [log EXCEPT ![i] = Append(log[i], m.mentries[1])]
+    /\ HasNoConflict(i, index, m.mentries)
+    /\ log' = [log EXCEPT ![i] = @ \o SubSeq(m.mentries, Len(log[i])-index+2, Len(m.mentries))]
     /\ UNCHANGED <<serverVars, commitIndex, messages, history>>
 
 \* @type: (Int, Int, Bool, AEREQT) => Bool;
@@ -680,7 +653,7 @@ AcceptAppendEntriesRequest(i, j, logOk, m) ==
              /\ LET index == m.mprevLogIndex + 1
                 IN \/ AppendEntriesAlreadyDone(i, j, index, m)
                    \/ ConflictAppendEntriesRequest(i, index, m)
-                   \/ NoConflictAppendEntriesRequest(i, m)
+                   \/ NoConflictAppendEntriesRequest(i, index, m)
 
 \* Server i receives an AppendEntries request from server j with
 \* m.mterm <= currentTerm[i]. This just handles m.entries of length 0 or 1, but
@@ -697,7 +670,10 @@ HandleAppendEntriesRequest(i, j, m) ==
        /\ \/ RejectAppendEntriesRequest(i, j, m, logOk)
           \/ ReturnToFollowerState(i, m)
           \/ AcceptAppendEntriesRequest(i, j, logOk, m)
-       /\ UNCHANGED <<candidateVars, leaderVars>>
+       /\ UNCHANGED <<candidateVars, leaderVars, confVars>>
+
+NextIndexForUnsuccessfulAppendResponse(m) ==
+    Max({nextIndex[m.mdest][m.msource] - 1, 1})
 
 \* Server i receives an AppendEntries response from server j with
 \* m.mterm = currentTerm[i].
@@ -705,121 +681,14 @@ HandleAppendEntriesRequest(i, j, m) ==
 HandleAppendEntriesResponse(i, j, m) ==
     /\ m.mterm = currentTerm[i]
     /\ \/ /\ m.msuccess \* successful
-          /\ nextIndex'  = [nextIndex  EXCEPT ![i][j] = m.mmatchIndex + 1]
-          /\ matchIndex' = [matchIndex EXCEPT ![i][j] = m.mmatchIndex]
+          \* etcd optimize append entries pipeline by allowing MsgApp messages sent out in any order
+          /\ nextIndex'  = [nextIndex  EXCEPT ![i][j] = Max({@, m.mmatchIndex + 1})]
+          /\ matchIndex' = [matchIndex EXCEPT ![i][j] = Max({@, m.mmatchIndex})]
        \/ /\ \lnot m.msuccess \* not successful
-          /\ nextIndex' = [nextIndex EXCEPT ![i][j] =
-                               Max({nextIndex[i][j] - 1, 1})]
+          /\ nextIndex' = [nextIndex EXCEPT ![i][j] = NextIndexForUnsuccessfulAppendResponse(m)]
           /\ UNCHANGED <<matchIndex>>
     /\ Discard(m)
-    /\ UNCHANGED <<serverVars, candidateVars, logVars>>
-
-\* Detached server i receives a CatchupRequest from leader j.
-HandleCatchupRequest(i, j, m) ==
-  \/ /\ m.mterm < currentTerm[i]
-     /\ Reply([mtype |-> CatchupResponse,
-               mterm |-> currentTerm[i],
-               msuccess |-> FALSE,
-               mmatchIndex |-> 0,
-               msource |-> i,
-               mdest |-> j,
-               mroundsLeft |-> 0],
-               m)
-     /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars>>
-  \/ /\ m.mterm >= currentTerm[i]
-     /\ currentTerm' = [currentTerm EXCEPT ![i] = m.mterm]
-    \* This was previously the following, but that's buggy
-    \* (shows how this spec wasn't tested very extensively)
-    \* /\ log' = [log EXCEPT ![i] = SubSeq(log[i], 1, m.mlogLen) \circ m.mentries]
-     /\ log' = [log EXCEPT ![i] =
-            IF log[i] = << >> THEN m.mentries
-            ELSE SubSeq(log[i], 1, Min({m.mlogLen, Len(log[i])})) \circ m.mentries]
-     /\ Reply([mtype |-> CatchupResponse,
-               mterm |-> m.mterm,
-               msuccess |-> TRUE,
-               mmatchIndex |-> Len(log[i]),
-               msource |-> i,
-               mdest |-> j,
-               mroundsLeft |-> m.mrounds - 1],
-              m)
-     /\ UNCHANGED <<state, votedFor, candidateVars, leaderVars, commitIndex>>
-
-\* Leader i receives a CatchupResponse from detached server j.
-HandleCatchupResponse(i, j, m) ==
-  \* A real system checks for progress every timeout interval.
-  \* Assume that if this response is called, the new server
-  \* has made progress.
-  /\ \/ /\ m.msuccess
-        /\ \/ /\ m.mmatchIndex /= commitIndex[i]
-              /\ m.mmatchIndex /= matchIndex[i][j]
-           \/ m.mmatchIndex = commitIndex[i]
-        /\ state[i] = Leader
-        /\ m.mterm = currentTerm[i]
-        /\ j \notin GetConfig(i)
-        /\ nextIndex' = [nextIndex EXCEPT ![i][j] = m.mmatchIndex + 1]
-        /\ matchIndex' = [matchIndex EXCEPT ![i][j] = m.mmatchIndex]
-        /\ \/ /\ m.mroundsLeft /= 0
-              /\ Reply([mtype |-> CatchupRequest,
-                        mterm |-> currentTerm[i],
-                        mentries |-> SubSeq(log[i],
-                                            nextIndex[i][j],
-                                            commitIndex[i]),
-                        mlogLen |-> nextIndex[i][j] - 1,
-                        msource |-> i,
-                        mdest |-> j,
-                        mrounds |-> m.mroundsLeft],
-                        m)
-           \/ /\ m.mroundsLeft = 0
-              \* A real system makes sure the final call to this handler is
-              \* received after a timeout interval.
-              \* We assume that if a timeout happened, the message
-              \* has already been dropped.
-              /\ Reply([mtype |-> CheckOldConfig,
-                       mterm |-> currentTerm[i],
-                       madd |-> TRUE,
-                       mserver |-> j,
-                       msource |-> i,
-                       mdest |-> i], m)
-     \/ /\ \/ \lnot m.msuccess
-           \/ /\ \/ m.mmatchIndex = commitIndex[i]
-                 \/ m.mmatchIndex = matchIndex[i][j]
-              /\ m.mmatchIndex /= commitIndex[i]
-           \/ state[i] /= Leader
-           \/ m.mterm /= currentTerm[i]
-           \/ j \in GetConfig(i)
-        /\ Discard(m)
-        /\ UNCHANGED <<leaderVars>>
-  /\ UNCHANGED <<serverVars, candidateVars, logVars>>
-
-\* Leader i receives a CheckOldConfig message.
-HandleCheckOldConfig(i, m) ==
-  \/ /\ state[i] /= Leader \/ m.mterm = currentTerm[i]
-     /\ Discard(m)
-     /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars>>
-  \/ /\ state[i] = Leader /\ m.mterm = currentTerm[i]
-     /\ \/ /\ GetMaxConfigIndex(i) <= commitIndex[i]
-            \* We only modify the log if the config actually changed
-           /\ LET action == IF m.madd THEN [action |-> "AddServer", executedOn |->i, added |-> m.mserver]
-                            ELSE [action |-> "RemoveServer", executedOn |-> i, removed |-> m.mserver]
-                  newConfig == IF m.madd THEN UNION { GetConfig(i), {m.mserver} }
-                               ELSE GetConfig(i) \ {m.mserver}
-                  configChanged == GetConfig(i) /= newConfig
-                  newEntry == [term |-> currentTerm[i], type |-> ConfigEntry, value |-> newConfig]
-                  newLog == IF configChanged THEN Append(log[i], newEntry) ELSE log[i]
-              IN 
-              /\ log' = [log EXCEPT ![i] = newLog]
-              /\ IF configChanged THEN DiscardWithMembershipChange(m, action) ELSE Discard(m)
-            /\ UNCHANGED <<commitIndex>>
-        \/ /\ GetMaxConfigIndex(i) > commitIndex[i]
-           /\ Reply([mtype |-> CheckOldConfig,
-                     mterm |-> currentTerm[i],
-                     madd |-> m.madd,
-                     mserver |-> m.mserver,
-                     msource |-> i,
-                     mdest |-> i],
-                     m)
-           /\ UNCHANGED <<logVars>>
-     /\ UNCHANGED <<serverVars, candidateVars, leaderVars>>
+    /\ UNCHANGED <<serverVars, candidateVars, logVars, confVars>>
     
 \* Any RPC with a newer term causes the recipient to advance its term first.
 \* @type: (Int, Int, MSG) => Bool;
@@ -829,14 +698,14 @@ UpdateTerm(i, j, m) ==
     /\ state'          = [state       EXCEPT ![i] = Follower]
     /\ votedFor'       = [votedFor    EXCEPT ![i] = Nil]
        \* messages is unchanged so m can be processed further.
-    /\ UNCHANGED <<messages, candidateVars, leaderVars, logVars, history>>
+    /\ UNCHANGED <<messages, candidateVars, leaderVars, logVars, history, confVars>>
 
 \* Responses with stale terms are ignored.
 \* @type: (Int, Int, MSG) => Bool;
 DropStaleResponse(i, j, m) ==
     /\ m.mterm < currentTerm[i]
     /\ Discard(m)
-    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars>>
+    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars, confVars>>
 
 \* Receive a message.
 ReceiveDirect(m) ==
@@ -855,12 +724,6 @@ ReceiveDirect(m) ==
     \/  /\ m.mtype = AppendEntriesResponse
         /\  \/ DropStaleResponse(i, j, m)
             \/ HandleAppendEntriesResponse(i, j, m)
-    \/  /\ m.mtype = CatchupRequest
-        /\ HandleCatchupRequest(i, j, m)
-    \/  /\ m.mtype = CatchupResponse
-        /\ HandleCatchupResponse(i, j, m)
-    \/  /\ m.mtype = CheckOldConfig
-        /\ HandleCheckOldConfig(i, m)
 
 \* @type: MSG => Bool;
 ReceiveWrapped(m) ==
@@ -893,7 +756,7 @@ DuplicateMessage(m) ==
     \* Do not duplicate loopback messages
     \* /\ m.msource /= m.mdest
     /\ SendWithoutHistory(m)
-    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars, history>>
+    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars, history, confVars>>
 
 \* The network drops a message
 \* @type: MSG => Bool;
@@ -901,7 +764,7 @@ DropMessage(m) ==
     \* Do not drop loopback messages
     \* /\ m.msource /= m.mdest
     /\ DiscardWithoutHistory(m)
-    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars, history>>
+    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars, history, confVars>>
 
 ----
 
@@ -909,7 +772,7 @@ DropMessage(m) ==
 NextAsync == 
     \/ \E i,j \in Server : RequestVote(i, j)
     \/ \E i \in Server : BecomeLeader(i)
-    \/ \E i \in Server, v \in Value : ClientRequest(i, v)
+    \/ \E i \in Server: ClientRequest(i, 0)
     \/ \E i \in Server : AdvanceCommitIndex(i)
     \/ \E i,j \in Server : AppendEntries(i, j)
     \/ \E m \in DOMAIN messages : Receive(m)
@@ -941,6 +804,7 @@ NextDynamic ==
     \/ Next
     \/ \E i, j \in Server : AddNewServer(i, j)
     \/ \E i, j \in Server : DeleteServer(i, j)
+    \/ \E i \in Server : ApplyConfChange(i)
 
 \* The specification must start with the initial state and transition according
 \* to Next.
@@ -1128,13 +992,13 @@ ElectionsUncontested == Cardinality({c \in DOMAIN state : state[c] = Candidate})
 CleanStartUntilFirstRequest ==
     ((history["hadNumLeaders"] < 1 /\ history["hadNumClientRequests"] < 1)) =>
     /\ \A i \in Server: history["server"][i]["restarted"] = 0
-    /\ Sum([i \in Server |-> history["server"][i]["timeout"]]) <= 1        
+    /\ FoldSeq(LAMBDA x,y: x+y, 0, [i \in Server |-> history["server"][i]["timeout"]]) <= 1        
     /\ ElectionsUncontested
 
 CleanStartUntilTwoLeaders ==
     (history["hadNumLeaders"] < 2) =>
-    /\ Sum([i \in Server |-> history["server"][i]["restarted"]]) <= 1      
-    /\ Sum([i \in Server |-> history["server"][i]["timeout"]]) <= 2        
+    /\ FoldSeq(LAMBDA x,y: x+y, 0, [i \in Server |-> history["server"][i]["restarted"]]) <= 1      
+    /\ FoldSeq(LAMBDA x,y: x+y, 0, [i \in Server |-> history["server"][i]["timeout"]]) <= 2        
 
 -----
 
