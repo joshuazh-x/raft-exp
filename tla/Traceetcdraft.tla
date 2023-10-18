@@ -156,7 +156,8 @@ RequestVoteIfLogged(i, j) ==
 ValidateAfterBecomeLeader(i) == 
     /\ logline.event.role = "StateLeader"
     /\ state'[i] = Leader
-
+    /\ currentTerm'[i] = logline.event.state.term
+    
 BecomeLeaderIfLogged(i) ==
     /\ LoglineIsNodeEvent("BecomeLeader", i)
     /\ BecomeLeader(i)
@@ -322,4 +323,9 @@ TraceMatched ==
     \* Note: Consider changing {1,2} to (Nat \ {0}) while validating traces with holes.
     [](l <= Len(TraceLog) => [](TLCGet("queue") \in {1,2} \/ l > Len(TraceLog)))
 
+etcd == INSTANCE etcdraft
+etcdSpec == etcd!Init /\ [][etcd!Next]_etcd!vars
+
 ==================================================================================
+
+
