@@ -283,6 +283,9 @@ type Config struct {
 	// This behavior will become unconditional in the future. See:
 	// https://github.com/etcd-io/raft/issues/83
 	StepDownOnRemoval bool
+
+	// raft state tracer
+	StateTracer RaftStateMachineTracer
 }
 
 func (c *Config) validate() error {
@@ -427,6 +430,9 @@ type raft struct {
 	// current term. Those will be handled as fast as first log is committed in
 	// current term.
 	pendingReadIndexMessages []pb.Message
+
+	stateTracer     RaftStateMachineTracer
+	initStateTraced bool
 }
 
 func newRaft(c *Config) *raft {
@@ -456,6 +462,7 @@ func newRaft(c *Config) *raft {
 		disableProposalForwarding:   c.DisableProposalForwarding,
 		disableConfChangeValidation: c.DisableConfChangeValidation,
 		stepDownOnRemoval:           c.StepDownOnRemoval,
+		stateTracer:                 c.StateTracer,
 	}
 
 	cfg, prs, err := confchange.Restore(confchange.Changer{
@@ -756,7 +763,7 @@ func (r *raft) appliedSnap(snap *pb.Snapshot) {
 // the commit index changed (in which case the caller should call
 // r.bcastAppend).
 func (r *raft) maybeCommit() bool {
-	traceNodeEvent(RsmCommit, r)
+	defer traceNodeEvent(RsmCommit, r)
 
 	mci := r.prs.Committed()
 	return r.raftLog.maybeCommit(mci, r.Term)
@@ -798,6 +805,10 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 	for i := range es {
 		es[i].Term = r.Term
 		es[i].Index = li + 1 + uint64(i)
+		if es[i].Type == pb.EntryNormal {
+			traceNodeEvent(RsmReplicate, r)
+		}
+
 	}
 	// Track the size of this uncommitted proposal.
 	if !r.increaseUncommittedSize(es) {
@@ -938,12 +949,12 @@ func (r *raft) becomeLeader() {
 	r.pendingConfIndex = r.raftLog.lastIndex()
 
 	traceNodeEvent(RsmBecomeLeader, r)
-
 	emptyEnt := pb.Entry{Data: nil}
 	if !r.appendEntry(emptyEnt) {
 		// This won't happen because we just called reset() above.
 		r.logger.Panic("empty entry was dropped")
 	}
+
 	// The payloadSize of an empty entry is 0 (see TestPayloadSizeOfEmptyEntry),
 	// so the preceding log append does not count against the uncommitted log
 	// quota of the new leader. In other words, after the call to appendEntry,
@@ -1062,6 +1073,7 @@ func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int, rejected 
 }
 
 func (r *raft) Step(m pb.Message) error {
+	traceInitStateOnce(r)
 	traceReceiveMessage(r, &m)
 
 	// Handle the message term, which may result in our stepping down to a follower.
@@ -1309,8 +1321,6 @@ func stepLeader(r *raft, m pb.Message) error {
 				} else {
 					r.pendingConfIndex = r.raftLog.lastIndex() + uint64(i) + 1
 				}
-			} else {
-				traceNodeEvent(RsmReplicate, r)
 			}
 		}
 
@@ -1481,6 +1491,7 @@ func stepLeader(r *raft, m pb.Message) error {
 				if pr.State == tracker.StateReplicate {
 					pr.BecomeProbe()
 				}
+				traceReduceNextIndex(r, m.From)
 				r.sendAppend(m.From)
 			}
 		} else {

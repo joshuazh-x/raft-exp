@@ -4,10 +4,9 @@ EXTENDS etcdraft, Json, IOUtils, Sequences
 \* raft.pb.go enum MessageType
 RaftMsgType ==
     "MsgApp" :> AppendEntriesRequest @@ "MsgAppResp" :> AppendEntriesResponse @@
-    "MsgVote" :> RequestVoteRequest @@ "MsgVoteResp" :> RequestVoteResponse
-
-LeadershipState ==
-    Leader :> "StateLeader" @@ Follower :> "StateFollower" @@ Candidate :> "StateCandidate"
+    "MsgVote" :> RequestVoteRequest @@ "MsgVoteResp" :> RequestVoteResponse @@
+    "MsgHeartbeat" :> AppendEntriesRequest @@ "MsgHeartbeatResp" :> AppendEntriesResponse @@
+    "MsgSnap" :> AppendEntriesRequest
 
 -------------------------------------------------------------------------------------
 
@@ -25,29 +24,62 @@ TraceLog ==
      \* Fall back to trace.ndjson if the JSON environment variable is not set.
     SelectSeq(ndJsonDeserialize(JsonFile), LAMBDA l: "tag" \in DOMAIN l /\ l.tag = "raft_trace")
 
-
 ASSUME PrintT(<< "Trace:", JsonFile, "Length:", Len(TraceLog)>>)
 
-TraceServer == { TraceLog[i].event.nid: i \in DOMAIN TraceLog }
-        
-TraceFirstActionLogIndex ==
-    FoldSeq(LAMBDA x, y: [y EXCEPT ![TraceLog[x].event.nid] = IF @ = 0 /\ TraceLog[x].event.name # "ApplyConfChange" THEN x ELSE @], [ i \in TraceServer |-> 0], [j \in DOMAIN TraceLog |-> j])
+TraceServer == FoldSeq(
+    LAMBDA x, y: y \cup IF  /\ x.event.name = "ChangeConf" 
+                            /\ "changes" \in DOMAIN x.event.prop.cc
+                            /\ x.event.prop.cc.changes[1].action \in {"AddNewServer", "AddLearner"}
+                            THEN {x.event.nid, x.event.prop.cc.changes[1].nid} 
+                            ELSE {x.event.nid},
+    {}, TraceLog)
+-------------------------------------------------------------------------------------
+ConfFromLog(l) == << ToSet(l.event.conf[1]), ToSet(l.event.conf[2]) >>
 
-ASSUME \A k \in DOMAIN TraceLog: k < TraceFirstActionLogIndex[TraceLog[k].event.nid] => TraceLog[k].event.state.term = 1 /\ TraceLog[k].event.state.vote = 0 /\ TraceLog[k].event.name = "ApplyConfChange"
-
+FirstInitStatesLog(i) ==
+    LET initStatesLogOfNode == {k \in DOMAIN TraceLog: TraceLog[k].event.nid = i /\ TraceLog[k].event.name = "InitState"}
+    IN  IF initStatesLogOfNode = {} THEN 
+            [
+                event |-> [
+                    state |-> [
+                        term |-> 0,
+                        vote |-> "",
+                        commit |-> 0 ],
+                    role |-> "",
+                    conf |-> << <<>>, <<>> >> ]
+            ] 
+        ELSE TraceLog[Min(initStatesLogOfNode)]
 
 TraceInitServer == ToSet(TraceLog[1].event.conf[1])
 ASSUME TraceInitServer \subseteq TraceServer
 
--------------------------------------------------------------------------------------
-ConfFromLog(l) == << ToSet(l.event.conf[1]), ToSet(l.event.conf[2]) >>
-   
-TraceInitConfVars == 
-    /\ pendingConfChangeIndex = [i \in Server |-> 0]
-    /\ config = [ i \in Server |-> ConfFromLog(TraceLog[TraceFirstActionLogIndex[i]]) ]
+MakeBootstrappedLog(i) == 
+    LET 
+        fil == FirstInitStatesLog(i)
+        n == fil.event.state.commit
+        prefix == [j \in 1..n-1 |-> [term  |-> 1, type |-> ConfigEntry]]
+    IN 
+        IF n > 0 THEN 
+            Append(prefix, [    term  |-> 1, 
+                                type |-> ConfigEntry, 
+                                value |-> [ newconf |-> ConfFromLog(fil)[1] ]
+                            ]) 
+        ELSE 
+            <<>>
+    
 
-TraceInitLogVars == /\ log = [i \in Server |-> [j \in 1..TraceLog[TraceFirstActionLogIndex[i]].event.state.commit |-> [term  |-> 1, type  |-> ConfigEntry]]]
-                    /\ commitIndex  = [i \in Server |-> TraceLog[TraceFirstActionLogIndex[i]].event.state.commit]
+TraceInitDurableStates == 
+    /\ durableStates = [
+        \* serverVars
+        currentTerm |-> [i \in Server |-> FirstInitStatesLog(i).event.state.term],
+        state |-> [i \in Server |-> FirstInitStatesLog(i).event.role],
+        votedFor |-> [i \in Server |-> FirstInitStatesLog(i).event.state.vote],
+        \* logVars
+        commitIndex |-> [i \in Server |-> FirstInitStatesLog(i).event.state.commit],
+        log |-> [i \in Server |-> MakeBootstrappedLog(i)],
+        \* confVars
+        pendingConfChangeIndex |-> [i \in Server |-> 0],
+        config |->[ i \in Server |-> ConfFromLog(FirstInitStatesLog(i)) ] ]
 
 OneMoreMessage(msg) ==
     \/ msg \notin DOMAIN messages /\ msg \in DOMAIN messages' /\ messages'[msg] = 1
@@ -59,31 +91,25 @@ OneLessMessage(msg) ==
 
 -------------------------------------------------------------------------------------
 
-VARIABLE l, logline
-
-NextLogIndex(x) == IF x < Len(TraceLog) 
-                        THEN CHOOSE k \in (x+1)..Len(TraceLog): k >= TraceFirstActionLogIndex[TraceLog[k].event.nid] 
-                        ELSE x+1
+VARIABLE l
+logline == TraceLog[l]
 
 TraceInit ==
-    /\ l = NextLogIndex(0)
+    /\ l = 1
     /\ logline = TraceLog[l]
     /\ Init
 
 StepToNextTrace == 
-    /\ l' = IF l+1>Len(TraceLog) THEN l+1 ELSE NextLogIndex(l)
-    /\ logline' = IF l' <= Len(TraceLog) THEN TraceLog[l'] ELSE {}
+    /\ l' = l+1
 
 StepToNextTraceIfMessageIsProcessed(msg) ==
     IF OneLessMessage(msg) 
-        THEN StepToNextTrace 
-        ELSE UNCHANGED <<l, logline>>
+        THEN StepToNextTrace
+        ELSE UNCHANGED <<l>>
 
 -------------------------------------------------------------------------------------
 
-
 LoglineIsEvent(e) ==
-    \* Equals FALSE if we get past the end of the log, causing model checking to stop.
     /\ l \in 1..Len(TraceLog)
     /\ logline.event.name = e
 
@@ -114,7 +140,7 @@ LoglineIsAppendEntriesResponse(m) ==
     /\ m.msource = logline.event.msg.from
     /\ m.mterm = logline.event.msg.term
     /\ m.msuccess = ~logline.event.msg.reject
-    /\ m.mmatchIndex = IF logline.event.msg.reject THEN logline.event.msg.rejectHint ELSE logline.event.msg.index
+    /\ (\lnot logline.event.msg.reject) => m.mmatchIndex = logline.event.msg.index
 
 LoglineIsRequestVoteRequest(m) ==  
     /\ m.mtype = RequestVoteRequest
@@ -133,8 +159,17 @@ LoglineIsRequestVoteResponse(m) ==
     /\ m.mterm = logline.event.msg.term
     /\ m.mvoteGranted = ~logline.event.msg.reject
 
+ValidateStates(i) ==
+    /\ currentTerm'[i] = logline.event.state.term
+    /\ state'[i] = logline.event.role
+    /\ votedFor'[i] = logline.event.state.vote
+    /\ Len(log'[i]) = logline.event.log
+    /\ commitIndex'[i] = logline.event.state.commit
+    /\ config'[i] = ConfFromLog(logline)
+
 \* perform RequestVote transition if logline indicates so
 ValidateAfterRequestVote(i, j) == 
+    /\ ValidateStates(i)
     /\ \E m \in DOMAIN messages':
        /\ \/ LoglineIsRequestVoteRequest(m)
           \/ /\ LoglineIsRequestVoteResponse(m)
@@ -142,48 +177,43 @@ ValidateAfterRequestVote(i, j) ==
        /\ OneMoreMessage(m)
 
 RequestVoteIfLogged(i, j) ==
-    /\ \/ /\ LoglineIsMessageEvent("SendRequestVoteRequest", i, j)
-          /\ PrintT(<<"SendRequestVoteRequest", "from:", i, "to:", j>>)
+    /\ \/ LoglineIsMessageEvent("SendRequestVoteRequest", i, j)
        \* etcd candidate sends MsgVoteResp to itself upon compain starting
        \/ /\ LoglineIsMessageEvent("SendRequestVoteResponse", i, j)
           /\ i = j 
-          /\ PrintT(<<"SendRequestVoteResponse", "from:", i, "to:", j>>)
     /\ RequestVote(i, j)
     /\ ValidateAfterRequestVote(i, j)
-    /\ StepToNextTrace
 
 \* perform BecomeLeader transition if logline indicates so
 ValidateAfterBecomeLeader(i) == 
+    /\ ValidateStates(i)
     /\ logline.event.role = "StateLeader"
     /\ state'[i] = Leader
-    /\ currentTerm'[i] = logline.event.state.term
     
 BecomeLeaderIfLogged(i) ==
     /\ LoglineIsNodeEvent("BecomeLeader", i)
     /\ BecomeLeader(i)
     /\ ValidateAfterBecomeLeader(i)
-    /\ StepToNextTrace
 
 \* perform ClientRequest transition if logline indicates so
 ClientRequestIfLogged(i, v) == 
     /\ LoglineIsNodeEvent("Replicate", i)
     /\ ClientRequest(i, v)
-    /\ StepToNextTrace
 
 \* perform AdvanceCommitIndex transition if logline indicates so
 ValidateAfterAdvanceCommitIndex(i) ==
+    /\ ValidateStates(i)
     /\ logline.event.role = "StateLeader"
     /\ state[i] = Leader
-    /\ commitIndex'[i] >= logline.event.state.commit
 
 AdvanceCommitIndexIfLogged(i) ==
     /\ LoglineIsNodeEvent("Commit", i)
     /\ AdvanceCommitIndex(i)
     /\ ValidateAfterAdvanceCommitIndex(i)    
-    /\ StepToNextTrace
 
 \* perform AppendEntries transition if logline indicates so
 ValidateAfterAppendEntries(i, j) ==
+    /\ ValidateStates(i)
     /\ \E msg \in DOMAIN messages':
         /\ \/ LoglineIsAppendEntriesRequest(msg)
            \/ /\ LoglineIsAppendEntriesResponse(msg)
@@ -191,40 +221,59 @@ ValidateAfterAppendEntries(i, j) ==
         \* There is now one more message of this type.
         /\ OneMoreMessage(msg)
 
-TraceEntriesToAppend == logline.event.msg.entries
-
-AppendEntriesIfLogged(i, j) == 
+AppendEntriesIfLogged(i, j, ani) == 
     /\ \/ /\ LoglineIsMessageEvent("SendAppendEntriesRequest", i, j)
-          /\ PrintT(<<"SendAppendEntriesRequest", "from:", i, "to:", j>>)
+          /\ logline.event.msg.type = "MsgApp"
+          /\ ani = logline.event.prop.advanceNextIndex
        \* etcd leader sends MsgAppResp to itself after appending log entry
        \/ /\ LoglineIsMessageEvent("SendAppendEntriesResponse", i, j)
           /\ i = j
-          /\ PrintT(<<"SendAppendEntriesResponse", "from:", i, "to:", j>>)
-    /\ AppendEntries(i, j)
+    /\ AppendEntries(i, j, ani)
     /\ ValidateAfterAppendEntries(i, j)
-    /\ StepToNextTrace
 
+HeartbeatIfLogged(i, j) ==
+    /\ LoglineIsMessageEvent("SendAppendEntriesRequest", i, j)
+    /\ logline.event.msg.type = "MsgHeartbeat"
+    /\ Heartbeat(i, j)
+    /\ ValidateAfterAppendEntries(i, j)
+
+SnapshotFromLog ==
+    /\ logline.event.msg.type = "MsgSnap"
+    /\ Send([   mtype           |-> AppendEntriesRequest,
+                mterm           |-> logline.event.msg.term,
+                mprevLogIndex   |-> logline.event.msg.index,
+                mprevLogTerm    |-> logline.event.msg.logTerm,
+                mentries        |-> SubSeq(log[logline.event.nid], logline.event.msg.index + 1, logline.event.msg.entries + logline.event.msg.index),
+                mcommitIndex    |-> logline.event.msg.commit,
+                msource         |-> logline.event.msg.from,
+                mdest           |-> logline.event.msg.to    ])
+    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars, confVars, durableStates>> 
+
+SnapshotIfLogged(i, j) ==
+    /\ LoglineIsMessageEvent("SendAppendEntriesRequest", i, j)
+    /\ logline.event.msg.type = "MsgSnap"
+    /\ SnapshotFromLog
+    /\ ValidateAfterAppendEntries(i, j)
+
+ReceiveMessageTraceNames == { "ReceiveAppendEntriesRequest", "ReceiveAppendEntriesResponse", "ReceiveRequestVoteRequest", "ReceiveRequestVoteResponse", "ReceiveSnapshot" }
 \* perform Receive transition if logline indicates so
 LoglineIsReceivedMessage(m) ==
     \/ /\ LoglineIsEvent("ReceiveAppendEntriesRequest")
        /\ LoglineIsAppendEntriesRequest(m)
-       /\ PrintT(<<"ReceiveAppendEntriesRequest", "from:", m.msource, "to:", m.mdest>>)
     \/ /\ LoglineIsEvent("ReceiveAppendEntriesResponse")
        /\ LoglineIsAppendEntriesResponse(m)
-       /\ PrintT(<<"ReceiveAppendEntriesResponse", "from:", m.msource, "to:", m.mdest>>)
     \/ /\ LoglineIsEvent("ReceiveRequestVoteRequest")
        /\ LoglineIsRequestVoteRequest(m) 
-       /\ PrintT(<<"ReceiveRequestVoteRequest", "from:", m.msource, "to:", m.mdest>>)
     \/ /\ LoglineIsEvent("ReceiveRequestVoteResponse")
        /\ LoglineIsRequestVoteResponse(m)
-       /\ PrintT(<<"ReceiveRequestVoteResponse", "from:", m.msource, "to:", m.mdest, "grant:", m.mvoteGranted>>)
+    \/ /\ LoglineIsEvent("ReceiveSnapshot")
+       /\ LoglineIsAppendEntriesRequest(m)
 
-TraceNextIndexForUnsuccessfulAppendResponse(m) == logline.event.msg.index
+TraceNextIndexForUnsuccessfulAppendResponse(m) == logline.event.msg.rejectHint
 
 ReceiveIfLogged(m) == 
     /\ LoglineIsReceivedMessage(m)
     /\ Receive(m)
-    /\ StepToNextTraceIfMessageIsProcessed(m)
 
 \* perform Timeout transition if logline indicates so
 ValidateAfterTimeout(i) == 
@@ -237,35 +286,60 @@ TimeoutIfLogged(i) ==
     /\ LoglineIsNodeEvent("BecomeCandidate", i)
     /\ Timeout(i)
     /\ ValidateAfterTimeout(i)    
-    /\ StepToNextTrace
-    /\ PrintT(<<"BecomeCandidate", "node:", i>>)
 
 \* perform AddNewServer transition if logline indicates so
 AddNewServerIfLogged(i, j) ==
     /\ LoglineIsNodeEvent("ChangeConf", i)
-    /\ Len(logline.event.cc.changes) = 1
-    /\ logline.event.cc.changes[1].action = "AddNewServer"
-    /\ logline.event.cc.changes[1].nid = j
+    /\ Len(logline.event.prop.cc.changes) = 1
+    /\ logline.event.prop.cc.changes[1].action = "AddNewServer"
+    /\ logline.event.prop.cc.changes[1].nid = j
     /\ AddNewServer(i, j)
-    /\ StepToNextTrace
-    /\ PrintT(<<"ChangeConf", "node:", i, "new:", j>>)
 
 \* perform DeleteServer transition if logline indicates so
 DeleteServerIfLogged(i, j) ==
     /\ LoglineIsNodeEvent("ChangeConf", i)
-    /\ Len(logline.event.cc.changes) = 1
-    /\ logline.event.cc.changes[1].action = "RemoveServer"
-    /\ logline.event.cc.changes[1].nid = j
+    /\ Len(logline.event.prop.cc.changes) = 1
+    /\ logline.event.prop.cc.changes[1].action = "RemoveServer"
+    /\ logline.event.prop.cc.changes[1].nid = j
     /\ DeleteServer(i, j)
-    /\ StepToNextTrace
-    /\ PrintT(<<"ChangeConf", "node:", i, "delete:", j>>)
+    
 
-\* perform ApplyConfChange transition if logline indicates so
-ApplyConfChangeIfLogged(i) ==
+\* perform ApplyConfChangeInLeader transition if logline indicates so
+ApplySimpleConfChangeInLeaderIfLogged(i) ==
     /\ LoglineIsNodeEvent("ApplyConfChange", i)
-    /\ ApplyConfChange(i)
-    /\ StepToNextTrace
-    /\ PrintT(<<"ApplyConfChange", "node:", i>>)
+    /\ logline.event.role = "StateLeader"
+    /\ ApplySimpleConfChangeInLeader(i)
+
+ReadyIfLogged(i) ==
+    /\ LoglineIsNodeEvent("Ready", i)
+    /\ Ready(i)
+
+RestartIfLogged(i) ==
+    /\ LoglineIsNodeEvent("InitState", i)
+    /\ Restart(i)
+    /\ ValidateStates(i)
+
+LoglineIsBecomeFollowerInUpdateTerm ==
+    /\ LoglineIsEvent("BecomeFollower")
+    /\ LET 
+            k == SelectLastInSubSeq(TraceLog, 1, l-1, LAMBDA x: x.event.nid = logline.event.nid)
+       IN 
+            /\ k > 0 
+            /\ TraceLog[k].event.name \in ReceiveMessageTraceNames
+            /\ TraceLog[k].event.state.term < TraceLog[k].event.msg.term
+            /\ TraceLog[k].event.msg.term = logline.event.state.term
+
+BecomeFollowerIfLogged(i, t) ==
+    /\ LoglineIsNodeEvent("BecomeFollower", i)
+    /\ \lnot LoglineIsBecomeFollowerInUpdateTerm
+    /\ BecomeFollower(i, t)
+    /\ ValidateStates(i)
+
+ReduceNextIndexIfLogged(i, j, k) ==
+    /\ LoglineIsNodeEvent("ReduceNextIndex", i)
+    /\ logline.event.prop.peer = j
+    /\ logline.event.prop.nextIndex = k + 1
+    /\ ReduceNextIndex(i, j, k)
 
 \* skip unused logs
 SkipUnusedLogline ==
@@ -273,22 +347,40 @@ SkipUnusedLogline ==
           /\ logline.event.msg.from # logline.event.msg.to
        \/ /\ LoglineIsEvent("SendRequestVoteResponse")
           /\ logline.event.msg.from # logline.event.msg.to
-       \/ LoglineIsEvent("BecomeFollower")
-    /\ PrintT(<<"skip", "line:", l, "event:", logline.event.name>>)
+       \/ LoglineIsBecomeFollowerInUpdateTerm
+       \/ /\ LoglineIsEvent("ApplyConfChange")
+          /\ logline.event.role # "StateLeader"
+    /\ UNCHANGED <<vars>>
+
+\* Next actions where each one 
+TraceNextNonReceiveActions ==
+    /\ \/ \E i,j \in Server : RequestVoteIfLogged(i, j)
+       \/ \E i \in Server : BecomeLeaderIfLogged(i)
+       \/ \E i \in Server : ClientRequestIfLogged(i, 0)
+       \/ \E i \in Server : AdvanceCommitIndexIfLogged(i)
+       \/ \E i,j \in Server, ani \in BOOLEAN: AppendEntriesIfLogged(i, j, ani)
+       \/ \E i \in Server : TimeoutIfLogged(i)
+       \/ \E i,j \in Server: AddNewServerIfLogged(i, j)
+       \/ \E i,j \in Server: DeleteServerIfLogged(i, j)
+       \/ \E i \in Server: ApplySimpleConfChangeInLeaderIfLogged(i)
+       \/ \E i \in Server: ReadyIfLogged(i)
+       \/ \E i \in Server: RestartIfLogged(i)
+       \/ \E i \in Server: \E t \in currentTerm[i]..FoldSeq(LAMBDA x,y: Max({x,y}), 0, currentTerm): BecomeFollowerIfLogged(i, t)
+       \/ \E i,j \in Server: HeartbeatIfLogged(i, j)
+       \/ \E i,j \in Server: SnapshotIfLogged(i, j)
+       \/ \E i,j \in Server: \E k \in matchIndex[i][j]..Min({Len(log[j]), nextIndex[i][j]-1}): ReduceNextIndexIfLogged(i, j, k)
+       \/ SkipUnusedLogline
     /\ StepToNextTrace
-    /\ UNCHANGED <<vars, history>>
+
+TraceNextReceiveActions ==
+    \E m \in DOMAIN messages : 
+        /\ ReceiveIfLogged(m)
+        /\ StepToNextTraceIfMessageIsProcessed(m)
 
 TraceNext ==
-    \/ \E i,j \in Server : RequestVoteIfLogged(i, j)
-    \/ \E i \in Server : BecomeLeaderIfLogged(i)
-    \/ \E i \in Server : ClientRequestIfLogged(i, 0)
-    \/ \E i \in Server : AdvanceCommitIndexIfLogged(i)
-    \/ \E i,j \in Server : AppendEntriesIfLogged(i, j)
-    \/ \E m \in DOMAIN messages : ReceiveIfLogged(m)
-    \/ \E i \in Server : TimeoutIfLogged(i)
-    \/ SkipUnusedLogline
+    \/ TraceNextNonReceiveActions
+    \/ TraceNextReceiveActions
  
-
 TraceSpec ==
     TraceInit /\ [][TraceNext]_<<l, vars>>
 
@@ -324,7 +416,7 @@ TraceMatched ==
     [](l <= Len(TraceLog) => [](TLCGet("queue") \in {1,2} \/ l > Len(TraceLog)))
 
 etcd == INSTANCE etcdraft
-etcdSpec == etcd!Init /\ [][etcd!Next]_etcd!vars
+etcdSpec == etcd!Init /\ [][etcd!NextDynamic]_etcd!vars
 
 ==================================================================================
 
