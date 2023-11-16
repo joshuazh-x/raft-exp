@@ -68,8 +68,8 @@ MakeBootstrappedLog(i) ==
             <<>>
     
 
-TraceInitDurableStates == 
-    /\ durableStates = [
+TraceInitDurableState == 
+    /\ durableState = [
         \* serverVars
         currentTerm |-> [i \in Server |-> FirstInitStatesLog(i).event.state.term],
         state |-> [i \in Server |-> FirstInitStatesLog(i).event.role],
@@ -82,8 +82,8 @@ TraceInitDurableStates ==
         config |->[ i \in Server |-> ConfFromLog(FirstInitStatesLog(i)) ] ]
 
 OneMoreMessage(msg) ==
-    \/ msg \notin DOMAIN messages /\ msg \in DOMAIN messages' /\ messages'[msg] = 1
-    \/ msg \in DOMAIN messages /\ messages'[msg] = messages[msg] + 1
+    \/ msg \notin DOMAIN pendingMessages /\ msg \in DOMAIN pendingMessages' /\ pendingMessages'[msg] = 1
+    \/ msg \in DOMAIN pendingMessages /\ messages'[msg] = pendingMessages[msg] + 1
 
 OneLessMessage(msg) ==
     \/ msg \in DOMAIN messages /\ messages[msg] = 1 /\ msg \notin DOMAIN messages'
@@ -170,7 +170,7 @@ ValidateStates(i) ==
 \* perform RequestVote transition if logline indicates so
 ValidateAfterRequestVote(i, j) == 
     /\ ValidateStates(i)
-    /\ \E m \in DOMAIN messages':
+    /\ \E m \in DOMAIN pendingMessages':
        /\ \/ LoglineIsRequestVoteRequest(m)
           \/ /\ LoglineIsRequestVoteResponse(m)
              /\ m.msource = m.mdest
@@ -214,45 +214,28 @@ AdvanceCommitIndexIfLogged(i) ==
 \* perform AppendEntries transition if logline indicates so
 ValidateAfterAppendEntries(i, j) ==
     /\ ValidateStates(i)
-    /\ \E msg \in DOMAIN messages':
+    /\ \E msg \in DOMAIN pendingMessages':
         /\ \/ LoglineIsAppendEntriesRequest(msg)
            \/ /\ LoglineIsAppendEntriesResponse(msg)
               /\ msg.msource = msg.mdest
         \* There is now one more message of this type.
         /\ OneMoreMessage(msg)
 
-AppendEntriesIfLogged(i, j, ani) == 
+AppendEntriesIfLogged(i, j, range) == 
     /\ \/ /\ LoglineIsMessageEvent("SendAppendEntriesRequest", i, j)
-          /\ logline.event.msg.type = "MsgApp"
-          /\ ani = logline.event.prop.advanceNextIndex
+          /\ \/ /\ logline.event.msg.type = "MsgApp"
+                /\ range[1] = logline.event.msg.index + 1
+                /\ range[2] = range[1] + logline.event.msg.entries
+             \/ /\ logline.event.msg.type = "MsgHeartbeat"
+                /\ range[1] = logline.event.msg.commit + 1
+                /\ range[2] = range[1]
+             \/ /\ logline.event.msg.type = "MsgSnapshot"
+                /\ range[1] = 1 
+                /\ range[2] = 1 + logline.event.msg.entries
        \* etcd leader sends MsgAppResp to itself after appending log entry
        \/ /\ LoglineIsMessageEvent("SendAppendEntriesResponse", i, j)
           /\ i = j
-    /\ AppendEntries(i, j, ani)
-    /\ ValidateAfterAppendEntries(i, j)
-
-HeartbeatIfLogged(i, j) ==
-    /\ LoglineIsMessageEvent("SendAppendEntriesRequest", i, j)
-    /\ logline.event.msg.type = "MsgHeartbeat"
-    /\ Heartbeat(i, j)
-    /\ ValidateAfterAppendEntries(i, j)
-
-SnapshotFromLog ==
-    /\ logline.event.msg.type = "MsgSnap"
-    /\ Send([   mtype           |-> AppendEntriesRequest,
-                mterm           |-> logline.event.msg.term,
-                mprevLogIndex   |-> logline.event.msg.index,
-                mprevLogTerm    |-> logline.event.msg.logTerm,
-                mentries        |-> SubSeq(log[logline.event.nid], logline.event.msg.index + 1, logline.event.msg.entries + logline.event.msg.index),
-                mcommitIndex    |-> logline.event.msg.commit,
-                msource         |-> logline.event.msg.from,
-                mdest           |-> logline.event.msg.to    ])
-    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars, confVars, durableStates>> 
-
-SnapshotIfLogged(i, j) ==
-    /\ LoglineIsMessageEvent("SendAppendEntriesRequest", i, j)
-    /\ logline.event.msg.type = "MsgSnap"
-    /\ SnapshotFromLog
+    /\ AppendEntries(i, j, range)
     /\ ValidateAfterAppendEntries(i, j)
 
 ReceiveMessageTraceNames == { "ReceiveAppendEntriesRequest", "ReceiveAppendEntriesResponse", "ReceiveRequestVoteRequest", "ReceiveRequestVoteResponse", "ReceiveSnapshot" }
@@ -268,8 +251,6 @@ LoglineIsReceivedMessage(m) ==
        /\ LoglineIsRequestVoteResponse(m)
     \/ /\ LoglineIsEvent("ReceiveSnapshot")
        /\ LoglineIsAppendEntriesRequest(m)
-
-TraceNextIndexForUnsuccessfulAppendResponse(m) == logline.event.msg.rejectHint
 
 ReceiveIfLogged(m) == 
     /\ LoglineIsReceivedMessage(m)
@@ -332,14 +313,8 @@ LoglineIsBecomeFollowerInUpdateTerm ==
 BecomeFollowerIfLogged(i, t) ==
     /\ LoglineIsNodeEvent("BecomeFollower", i)
     /\ \lnot LoglineIsBecomeFollowerInUpdateTerm
-    /\ BecomeFollower(i, t)
+    /\ BecomeFollowerOfTerm(i, t)
     /\ ValidateStates(i)
-
-ReduceNextIndexIfLogged(i, j, k) ==
-    /\ LoglineIsNodeEvent("ReduceNextIndex", i)
-    /\ logline.event.prop.peer = j
-    /\ logline.event.prop.nextIndex = k + 1
-    /\ ReduceNextIndex(i, j, k)
 
 \* skip unused logs
 SkipUnusedLogline ==
@@ -358,7 +333,7 @@ TraceNextNonReceiveActions ==
        \/ \E i \in Server : BecomeLeaderIfLogged(i)
        \/ \E i \in Server : ClientRequestIfLogged(i, 0)
        \/ \E i \in Server : AdvanceCommitIndexIfLogged(i)
-       \/ \E i,j \in Server, ani \in BOOLEAN: AppendEntriesIfLogged(i, j, ani)
+       \/ \E i,j \in Server: \E b,e \in 1..Len(log[i])+1: AppendEntriesIfLogged(i, j, <<b,e>>)
        \/ \E i \in Server : TimeoutIfLogged(i)
        \/ \E i,j \in Server: AddNewServerIfLogged(i, j)
        \/ \E i,j \in Server: DeleteServerIfLogged(i, j)
@@ -366,9 +341,6 @@ TraceNextNonReceiveActions ==
        \/ \E i \in Server: ReadyIfLogged(i)
        \/ \E i \in Server: RestartIfLogged(i)
        \/ \E i \in Server: \E t \in currentTerm[i]..FoldSeq(LAMBDA x,y: Max({x,y}), 0, currentTerm): BecomeFollowerIfLogged(i, t)
-       \/ \E i,j \in Server: HeartbeatIfLogged(i, j)
-       \/ \E i,j \in Server: SnapshotIfLogged(i, j)
-       \/ \E i,j \in Server: \E k \in matchIndex[i][j]..Min({Len(log[j]), nextIndex[i][j]-1}): ReduceNextIndexIfLogged(i, j, k)
        \/ SkipUnusedLogline
     /\ StepToNextTrace
 
