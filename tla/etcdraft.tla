@@ -185,7 +185,7 @@ currentDurableState ==
 ----
 
 \* All variables; used for stuttering (asserting state hasn't changed).
-vars == <<messageVars, serverVars, candidateVars, leaderVars, logVars, config>>
+vars == <<messageVars, serverVars, candidateVars, leaderVars, logVars, config, durableState>>
 systemState == [
     \* messageVars
     messages |-> messages,
@@ -359,8 +359,8 @@ RequestVote(i, j) ==
 
 \* Leader i sends j an AppendEntries request containing entries in [b,e) range.
 \* N.B. range is right open
-\* @type: (Int, Int, <<Int, Int>>) => Bool;
-AppendEntries(i, j, range) ==
+\* @type: (Int, Int, <<Int, Int>>, Int) => Bool;
+AppendEntriesInRange(subtype, i, j, range) ==
     /\ range[1] <= range[2]
     /\ state[i] = Leader
     /\ j \in GetConfig(i)
@@ -375,12 +375,14 @@ AppendEntries(i, j, range) ==
             \* Send the entries
             lastEntry == Min({Len(log[i]), range[2]-1})
             entries == SubSeq(log[i], range[1], lastEntry)
+            commit == IF subtype = "heartbeat" THEN Min({commitIndex[i], matchIndex[i][j]}) ELSE Min({commitIndex[i], lastEntry})
             IN /\ Send([mtype          |-> AppendEntriesRequest,
+                        msubtype       |-> subtype,
                         mterm          |-> currentTerm[i],
                         mprevLogIndex  |-> prevLogIndex,
                         mprevLogTerm   |-> prevLogTerm,
                         mentries       |-> entries,
-                        mcommitIndex   |-> Min({commitIndex[i], lastEntry}),
+                        mcommitIndex   |-> commit,
                         msource        |-> i,
                         mdest          |-> j])
                /\ UNCHANGED <<messages, serverVars, candidateVars, leaderVars, logVars, config, durableState>> 
@@ -393,6 +395,15 @@ AppendEntries(i, j, range) ==
                  mdest           |-> i])
         /\ UNCHANGED <<messages, serverVars, candidateVars, leaderVars, logVars, config, durableState>>
 
+AppendEntries(i, j, range) ==
+    AppendEntriesInRange("app", i, j, range)
+
+Heartbeat(i, j) ==
+    AppendEntriesInRange("heartbeat", i, j, <<1,1>>)
+
+SendSnapshot(i, j, index) ==
+    AppendEntriesInRange("snapshot", i, j, <<1,index+1>>)
+    
 \* Candidate i transitions to leader.
 \* @type: Int => Bool;
 BecomeLeader(i) ==
@@ -493,6 +504,19 @@ Ready(i) ==
     /\ SendPendingMessages
     /\ UNCHANGED <<serverVars, leaderVars, candidateVars, logVars>>
 
+BecomeFollowerOfTerm(i, t) ==
+    /\ currentTerm'    = [currentTerm EXCEPT ![i] = t]
+    /\ state'          = [state       EXCEPT ![i] = Follower]
+    /\ IF currentTerm[i] # t THEN  
+            votedFor' = [votedFor    EXCEPT ![i] = Nil]
+       ELSE 
+            UNCHANGED <<votedFor>>
+
+StepDownToFollower(i) ==
+    /\ state[i] \in {Leader, Candidate}
+    /\ BecomeFollowerOfTerm(i, currentTerm[i])
+    /\ UNCHANGED <<messageVars, candidateVars, leaderVars, logVars, config, durableState>>
+
 ----
 \* Message handlers
 \* i = recipient, j = sender, m = message
@@ -517,7 +541,7 @@ HandleRequestVoteRequest(i, j, m) ==
                  msource      |-> i,
                  mdest        |-> j],
                  m)
-       /\ UNCHANGED <<messages, state, currentTerm, candidateVars, leaderVars, logVars, config, durableState>>
+       /\ UNCHANGED <<state, currentTerm, candidateVars, leaderVars, logVars, config, durableState>>
 
 \* Server i receives a RequestVote response from server j with
 \* m.mterm = currentTerm[i].
@@ -549,7 +573,7 @@ RejectAppendEntriesRequest(i, j, m, logOk) ==
               msource         |-> i,
               mdest           |-> j],
               m)
-    /\ UNCHANGED <<messages, serverVars, logVars, config, durableState>>
+    /\ UNCHANGED <<serverVars, logVars, config, durableState>>
 
 \* @type: (Int, MSG) => Bool;
 ReturnToFollowerState(i, m) ==
@@ -568,16 +592,17 @@ AppendEntriesAlreadyDone(i, j, index, m) ==
        \/ m.mentries = << >>
        \/ /\ m.mentries /= << >>
           /\ m.mprevLogIndex + Len(m.mentries) <= Len(log[i])
-          /\ HasNoConflict(i, index, m.mentries)
+          /\ HasNoConflict(i, index, m.mentries)          
     /\ commitIndex' = [commitIndex EXCEPT ![i] = IF index <= commitIndex[i] THEN @ ELSE Min({m.mcommitIndex, m.mprevLogIndex+Len(m.mentries)})]
     /\ Reply([  mtype           |-> AppendEntriesResponse,
+                msubtype        |-> m.msubtype,
                 mterm           |-> currentTerm[i],
                 msuccess        |-> TRUE,
-                mmatchIndex     |-> IF index <= commitIndex[i] THEN commitIndex[i] ELSE m.mprevLogIndex+Len(m.mentries),
+                mmatchIndex     |-> IF m.msubtype = "heartbeat" \/ index > commitIndex[i] THEN m.mprevLogIndex+Len(m.mentries) ELSE commitIndex[i],
                 msource         |-> i,
                 mdest           |-> j],
                 m)
-    /\ UNCHANGED <<messages, serverVars, log, config, durableState>>
+    /\ UNCHANGED <<serverVars, log, config, durableState>>
 
 \* @type: (Int, Int, AEREQT) => Bool;
 ConflictAppendEntriesRequest(i, index, m) ==
@@ -634,14 +659,6 @@ HandleAppendEntriesResponse(i, j, m) ==
           /\ UNCHANGED <<leaderVars>>
     /\ Discard(m)
     /\ UNCHANGED <<pendingMessages, serverVars, candidateVars, logVars, config, durableState>>
-
-BecomeFollowerOfTerm(i, t) ==
-    /\ currentTerm'    = [currentTerm EXCEPT ![i] = t]
-    /\ state'          = [state       EXCEPT ![i] = Follower]
-    /\ IF currentTerm[i] = t THEN  
-            votedFor' = [votedFor    EXCEPT ![i] = Nil]
-       ELSE 
-            UNCHANGED <<votedFor>>
 
 \* Any RPC with a newer term causes the recipient to advance its term first.
 \* @type: (Int, Int, MSG) => Bool;
@@ -724,10 +741,13 @@ NextAsync ==
     \/ \E i \in Server : BecomeLeader(i)
     \/ \E i \in Server: ClientRequest(i, 0)
     \/ \E i \in Server : AdvanceCommitIndex(i)
-    \/ \E i,j \in Server : \E b,e \in 1..Len(log[i])+1 : AppendEntries(i, j, <<b,e>>)
+    \/ \E i,j \in Server : \E b,e \in matchIndex[i][j]+1..Len(log[i])+1 : AppendEntries(i, j, <<b,e>>)
+    \/ \E i,j \in Server : Heartbeat(i, j)
+    \/ \E i,j \in Server : \E index \in 1..commitIndex[i] : SendSnapshot(i, j, index)
     \/ \E m \in DOMAIN messages : Receive(m)
     \/ \E i \in Server : Timeout(i)
     \/ \E i \in Server : Ready(i)
+    \/ \E i \in Server : StepDownToFollower(i)
         
 NextCrash == \E i \in Server : Restart(i)
 

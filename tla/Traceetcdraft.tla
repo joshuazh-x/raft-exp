@@ -8,6 +8,11 @@ RaftMsgType ==
     "MsgHeartbeat" :> AppendEntriesRequest @@ "MsgHeartbeatResp" :> AppendEntriesResponse @@
     "MsgSnap" :> AppendEntriesRequest
 
+RaftMsgSubtype ==
+    "MsgHeartbeat" :> "heartbeat" @@ "MsgHeartbeatResp" :> "heartbeat" @@
+    "MsgApp" :> "app" @@ "MsgAppResp" :> "app" @@
+    "MsgSnap" :> "snapshot"
+
 -------------------------------------------------------------------------------------
 
 \* Trace validation has been designed for TLC running in default model-checking
@@ -55,14 +60,14 @@ ASSUME TraceInitServer \subseteq TraceServer
 
 MakeBootstrappedLog(i) == 
     LET 
-        fil == FirstInitStatesLog(i)
-        n == fil.event.state.commit
+        fl == FirstInitStatesLog(i)
+        n == fl.event.state.commit
         prefix == [j \in 1..n-1 |-> [term  |-> 1, type |-> ConfigEntry]]
     IN 
         IF n > 0 THEN 
             Append(prefix, [    term  |-> 1, 
                                 type |-> ConfigEntry, 
-                                value |-> [ newconf |-> ConfFromLog(fil)[1] ]
+                                value |-> [ newconf |-> ConfFromLog(fl)[1] ]
                             ]) 
         ELSE 
             <<>>
@@ -94,10 +99,23 @@ OneLessMessage(msg) ==
 VARIABLE l
 logline == TraceLog[l]
 
+TraceInitServerVars ==  /\ currentTerm = [i \in Server |-> FirstInitStatesLog(i).event.state.term]
+                        /\ state       = [i \in Server |-> FirstInitStatesLog(i).event.role]
+                        /\ votedFor    = [i \in Server |-> FirstInitStatesLog(i).event.state.vote]
+TraceInitLogVars == /\ log          = [i \in Server |-> MakeBootstrappedLog(i)]
+               /\ commitIndex  = [i \in Server |-> FirstInitStatesLog(i).event.state.commit]
+TraceInitConfig == /\ config = [ i \in Server |-> ConfFromLog(FirstInitStatesLog(i)) ]
+
 TraceInit ==
     /\ l = 1
     /\ logline = TraceLog[l]
-    /\ Init
+    /\ InitMessageVars
+    /\ TraceInitServerVars
+    /\ InitCandidateVars
+    /\ InitLeaderVars
+    /\ TraceInitLogVars
+    /\ TraceInitConfig
+    /\ InitDurableState
 
 StepToNextTrace == 
     /\ l' = l+1
@@ -125,10 +143,17 @@ LoglineIsNodeEvent(e, i) ==
 LoglineIsAppendEntriesRequest(m) ==
     /\ m.mtype = AppendEntriesRequest
     /\ m.mtype = RaftMsgType[logline.event.msg.type]
+    /\ m.msubtype = RaftMsgSubtype[logline.event.msg.type]
     /\ m.mdest   = logline.event.msg.to
     /\ m.msource = logline.event.msg.from
     /\ m.mterm = logline.event.msg.term
-    /\ m.mcommitIndex = logline.event.msg.commit
+    \* MsgSnap is equivalent to MsgApp except that it does not
+    \* have commit index. Snapshot message contains leader log prefix
+    \* up to a committed entry. That means the receiver can safely advance
+    \* its commit index at least to the last log entry in snapshot message.
+    \* Setting commit index in the MsgSnap message would become unnecessary.
+    \* So we can safely ignore checking this against the model.
+    /\ m.msubtype # "snapshot" => m.mcommitIndex = logline.event.msg.commit
     /\ m.mprevLogTerm = logline.event.msg.logTerm
     /\ m.mprevLogIndex = logline.event.msg.index
     /\ Len(m.mentries) = logline.event.msg.entries
@@ -223,19 +248,26 @@ ValidateAfterAppendEntries(i, j) ==
 
 AppendEntriesIfLogged(i, j, range) == 
     /\ \/ /\ LoglineIsMessageEvent("SendAppendEntriesRequest", i, j)
-          /\ \/ /\ logline.event.msg.type = "MsgApp"
-                /\ range[1] = logline.event.msg.index + 1
-                /\ range[2] = range[1] + logline.event.msg.entries
-             \/ /\ logline.event.msg.type = "MsgHeartbeat"
-                /\ range[1] = logline.event.msg.commit + 1
-                /\ range[2] = range[1]
-             \/ /\ logline.event.msg.type = "MsgSnapshot"
-                /\ range[1] = 1 
-                /\ range[2] = 1 + logline.event.msg.entries
+          /\ logline.event.msg.type = "MsgApp"
+          /\ range[1] = logline.event.msg.index + 1
+          /\ range[2] = range[1] + logline.event.msg.entries
        \* etcd leader sends MsgAppResp to itself after appending log entry
        \/ /\ LoglineIsMessageEvent("SendAppendEntriesResponse", i, j)
           /\ i = j
     /\ AppendEntries(i, j, range)
+    /\ ValidateAfterAppendEntries(i, j)
+
+HeartbeatIfLogged(i, j) ==
+    /\ LoglineIsMessageEvent("SendAppendEntriesRequest", i, j)
+    /\ logline.event.msg.type = "MsgHeartbeat"
+    /\ Heartbeat(i, j)
+    /\ ValidateAfterAppendEntries(i, j)
+
+SendSnapshotIfLogged(i, j, index) ==
+    /\ LoglineIsMessageEvent("SendAppendEntriesRequest", i, j)
+    /\ logline.event.msg.type = "MsgSnap"
+    /\ index = logline.event.msg.entries
+    /\ SendSnapshot(i, j, index)
     /\ ValidateAfterAppendEntries(i, j)
 
 ReceiveMessageTraceNames == { "ReceiveAppendEntriesRequest", "ReceiveAppendEntriesResponse", "ReceiveRequestVoteRequest", "ReceiveRequestVoteResponse", "ReceiveSnapshot" }
@@ -300,20 +332,24 @@ RestartIfLogged(i) ==
     /\ Restart(i)
     /\ ValidateStates(i)
 
-LoglineIsBecomeFollowerInUpdateTerm ==
+LoglineIsBecomeFollowerInUpdateTermOrReturnToFollower ==
     /\ LoglineIsEvent("BecomeFollower")
     /\ LET 
             k == SelectLastInSubSeq(TraceLog, 1, l-1, LAMBDA x: x.event.nid = logline.event.nid)
        IN 
             /\ k > 0 
-            /\ TraceLog[k].event.name \in ReceiveMessageTraceNames
-            /\ TraceLog[k].event.state.term < TraceLog[k].event.msg.term
-            /\ TraceLog[k].event.msg.term = logline.event.state.term
+            /\ \/ /\ TraceLog[k].event.name \in ReceiveMessageTraceNames
+                  /\ TraceLog[k].event.state.term < TraceLog[k].event.msg.term
+                  /\ TraceLog[k].event.msg.term = logline.event.state.term
+               \/ /\ TraceLog[k].event.name = "ReceiveAppendEntriesRequest"
+                  /\ TraceLog[k].event.state.term = TraceLog[k].event.msg.term
+                  /\ TraceLog[k].event.msg.term = logline.event.state.term
+                  /\ TraceLog[k].event.role = Candidate
 
-BecomeFollowerIfLogged(i, t) ==
+StepDownToFollowerIfLogged(i) ==
     /\ LoglineIsNodeEvent("BecomeFollower", i)
-    /\ \lnot LoglineIsBecomeFollowerInUpdateTerm
-    /\ BecomeFollowerOfTerm(i, t)
+    /\ \lnot LoglineIsBecomeFollowerInUpdateTermOrReturnToFollower
+    /\ StepDownToFollower(i)
     /\ ValidateStates(i)
 
 \* skip unused logs
@@ -322,9 +358,10 @@ SkipUnusedLogline ==
           /\ logline.event.msg.from # logline.event.msg.to
        \/ /\ LoglineIsEvent("SendRequestVoteResponse")
           /\ logline.event.msg.from # logline.event.msg.to
-       \/ LoglineIsBecomeFollowerInUpdateTerm
+       \/ LoglineIsBecomeFollowerInUpdateTermOrReturnToFollower
        \/ /\ LoglineIsEvent("ApplyConfChange")
           /\ logline.event.role # "StateLeader"
+       \/ LoglineIsEvent("ReduceNextIndex") \* shall not be necessary when this is removed from raft
     /\ UNCHANGED <<vars>>
 
 \* Next actions where each one 
@@ -333,14 +370,16 @@ TraceNextNonReceiveActions ==
        \/ \E i \in Server : BecomeLeaderIfLogged(i)
        \/ \E i \in Server : ClientRequestIfLogged(i, 0)
        \/ \E i \in Server : AdvanceCommitIndexIfLogged(i)
-       \/ \E i,j \in Server: \E b,e \in 1..Len(log[i])+1: AppendEntriesIfLogged(i, j, <<b,e>>)
+       \/ \E i,j \in Server : \E b,e \in matchIndex[i][j]+1..Len(log[i])+1 : AppendEntriesIfLogged(i, j, <<b,e>>)
+       \/ \E i,j \in Server : HeartbeatIfLogged(i, j)
+       \/ \E i,j \in Server : \E index \in 1..commitIndex[i] : SendSnapshotIfLogged(i, j, index)
        \/ \E i \in Server : TimeoutIfLogged(i)
        \/ \E i,j \in Server: AddNewServerIfLogged(i, j)
        \/ \E i,j \in Server: DeleteServerIfLogged(i, j)
        \/ \E i \in Server: ApplySimpleConfChangeInLeaderIfLogged(i)
        \/ \E i \in Server: ReadyIfLogged(i)
        \/ \E i \in Server: RestartIfLogged(i)
-       \/ \E i \in Server: \E t \in currentTerm[i]..FoldSeq(LAMBDA x,y: Max({x,y}), 0, currentTerm): BecomeFollowerIfLogged(i, t)
+       \/ \E i \in Server: StepDownToFollowerIfLogged(i)
        \/ SkipUnusedLogline
     /\ StepToNextTrace
 

@@ -33,6 +33,11 @@ function colored_text {
     esac
 }
 
+function install_tlaplus {
+    wget -qN https://nightly.tlapl.us/dist/tla2tools.jar -P ${WORKING_DIR}/tools
+    wget -qN https://github.com/tlaplus/CommunityModules/releases/latest/download/CommunityModules-deps.jar -P ${WORKING_DIR}/tools
+}
+
 function validate {
     local trace_gz=${1}
     local trace="${WORKING_DIR}/$(basename "$trace_gz" .gz)"
@@ -41,7 +46,7 @@ function validate {
     
     preprocess_log ${trace}
 
-    env JSON="${trace}" java -XX:+UseParallelGC -cp tla2tools.jar:CommunityModules-deps.jar tlc2.TLC -config "${CONFIG}" "${SPEC}" -lncheck final -metadir "${WORKING_DIR}/states" > /dev/null
+    env JSON="${trace}" java -cp ${WORKING_DIR}/tools/tla2tools.jar:${WORKING_DIR}/tools/tla2tools.jar tlc2.TLC -config "${CONFIG}" "${SPEC}" -lncheck final -metadir "${WORKING_DIR}/states" > /dev/null
     result=$?
 
     if [ "${QUIET}" = false ]; then 
@@ -73,6 +78,8 @@ if [ "${QUIET}" = false ]; then
     echo "spec: ${SPEC}"
     echo "config: ${CONFIG}"
 fi
+
+install_tlaplus
 
 total=0
 passed=0
