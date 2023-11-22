@@ -1,5 +1,5 @@
 -------------------------------- MODULE Traceetcdraft -------------------------------
-EXTENDS etcdraft, Json, IOUtils, Sequences
+EXTENDS etcdraft, Json, IOUtils, Sequences, TLCExt
 
 \* raft.pb.go enum MessageType
 RaftMsgType ==
@@ -27,17 +27,17 @@ TraceLog ==
      \* Run TLC with (assuming a suitable "tlc" shell alias):
      \* $ JSON=../tests/raft_scenarios/4582.ndjson tlc -note Traceccfraft
      \* Fall back to trace.ndjson if the JSON environment variable is not set.
-    SelectSeq(ndJsonDeserialize(JsonFile), LAMBDA l: "tag" \in DOMAIN l /\ l.tag = "raft_trace")
+    SelectSeq(ndJsonDeserialize(JsonFile), LAMBDA l: "tag" \in DOMAIN l /\ l.tag = "trace")
 
 ASSUME PrintT(<< "Trace:", JsonFile, "Length:", Len(TraceLog)>>)
 
-TraceServer == FoldSeq(
+TraceServer == TLCEval(FoldSeq(
     LAMBDA x, y: y \cup IF  /\ x.event.name = "ChangeConf" 
                             /\ "changes" \in DOMAIN x.event.prop.cc
                             /\ x.event.prop.cc.changes[1].action \in {"AddNewServer", "AddLearner"}
                             THEN {x.event.nid, x.event.prop.cc.changes[1].nid} 
                             ELSE {x.event.nid},
-    {}, TraceLog)
+    {}, TraceLog))
 -------------------------------------------------------------------------------------
 ConfFromLog(l) == << ToSet(l.event.conf[1]), ToSet(l.event.conf[2]) >>
 
@@ -58,37 +58,9 @@ FirstInitStatesLog(i) ==
 TraceInitServer == ToSet(TraceLog[1].event.conf[1])
 ASSUME TraceInitServer \subseteq TraceServer
 
-MakeBootstrappedLog(i) == 
-    LET 
-        fl == FirstInitStatesLog(i)
-        n == fl.event.state.commit
-        prefix == [j \in 1..n-1 |-> [term  |-> 1, type |-> ConfigEntry]]
-    IN 
-        IF n > 0 THEN 
-            Append(prefix, [    term  |-> 1, 
-                                type |-> ConfigEntry, 
-                                value |-> [ newconf |-> ConfFromLog(fl)[1] ]
-                            ]) 
-        ELSE 
-            <<>>
-    
-
-TraceInitDurableState == 
-    /\ durableState = [
-        \* serverVars
-        currentTerm |-> [i \in Server |-> FirstInitStatesLog(i).event.state.term],
-        state |-> [i \in Server |-> FirstInitStatesLog(i).event.role],
-        votedFor |-> [i \in Server |-> FirstInitStatesLog(i).event.state.vote],
-        \* logVars
-        commitIndex |-> [i \in Server |-> FirstInitStatesLog(i).event.state.commit],
-        log |-> [i \in Server |-> MakeBootstrappedLog(i)],
-        \* confVars
-        pendingConfChangeIndex |-> [i \in Server |-> 0],
-        config |->[ i \in Server |-> ConfFromLog(FirstInitStatesLog(i)) ] ]
-
 OneMoreMessage(msg) ==
     \/ msg \notin DOMAIN pendingMessages /\ msg \in DOMAIN pendingMessages' /\ pendingMessages'[msg] = 1
-    \/ msg \in DOMAIN pendingMessages /\ messages'[msg] = pendingMessages[msg] + 1
+    \/ msg \in DOMAIN pendingMessages /\ pendingMessages'[msg] = pendingMessages[msg] + 1
 
 OneLessMessage(msg) ==
     \/ msg \in DOMAIN messages /\ messages[msg] = 1 /\ msg \notin DOMAIN messages'
@@ -99,23 +71,10 @@ OneLessMessage(msg) ==
 VARIABLE l
 logline == TraceLog[l]
 
-TraceInitServerVars ==  /\ currentTerm = [i \in Server |-> FirstInitStatesLog(i).event.state.term]
-                        /\ state       = [i \in Server |-> FirstInitStatesLog(i).event.role]
-                        /\ votedFor    = [i \in Server |-> FirstInitStatesLog(i).event.state.vote]
-TraceInitLogVars == /\ log          = [i \in Server |-> MakeBootstrappedLog(i)]
-               /\ commitIndex  = [i \in Server |-> FirstInitStatesLog(i).event.state.commit]
-TraceInitConfig == /\ config = [ i \in Server |-> ConfFromLog(FirstInitStatesLog(i)) ]
-
 TraceInit ==
     /\ l = 1
     /\ logline = TraceLog[l]
-    /\ InitMessageVars
-    /\ TraceInitServerVars
-    /\ InitCandidateVars
-    /\ InitLeaderVars
-    /\ TraceInitLogVars
-    /\ TraceInitConfig
-    /\ InitDurableState
+    /\ Init
 
 StepToNextTrace == 
     /\ l' = l+1
@@ -128,7 +87,7 @@ StepToNextTraceIfMessageIsProcessed(msg) ==
 -------------------------------------------------------------------------------------
 
 LoglineIsEvent(e) ==
-    /\ l \in 1..Len(TraceLog)
+    /\ l <= Len(TraceLog)
     /\ logline.event.name = e
 
 LoglineIsMessageEvent(e, i, j) ==
@@ -188,9 +147,9 @@ ValidateStates(i) ==
     /\ currentTerm'[i] = logline.event.state.term
     /\ state'[i] = logline.event.role
     /\ votedFor'[i] = logline.event.state.vote
-    /\ Len(log'[i]) = logline.event.log
+    /\ log'[i].len = logline.event.log
     /\ commitIndex'[i] = logline.event.state.commit
-    /\ config'[i] = ConfFromLog(logline)
+    /\ config'[i].jointConfig = ConfFromLog(logline)
 
 \* perform RequestVote transition if logline indicates so
 ValidateAfterRequestVote(i, j) == 
@@ -308,6 +267,13 @@ AddNewServerIfLogged(i, j) ==
     /\ logline.event.prop.cc.changes[1].nid = j
     /\ AddNewServer(i, j)
 
+AddLearnerIfLogged(i, j) ==
+    /\ LoglineIsNodeEvent("ChangeConf", i)
+    /\ Len(logline.event.prop.cc.changes) = 1
+    /\ logline.event.prop.cc.changes[1].action = "AddLearner"
+    /\ logline.event.prop.cc.changes[1].nid = j
+    /\ AddLearner(i, j)
+
 \* perform DeleteServer transition if logline indicates so
 DeleteServerIfLogged(i, j) ==
     /\ LoglineIsNodeEvent("ChangeConf", i)
@@ -370,11 +336,12 @@ TraceNextNonReceiveActions ==
        \/ \E i \in Server : BecomeLeaderIfLogged(i)
        \/ \E i \in Server : ClientRequestIfLogged(i, 0)
        \/ \E i \in Server : AdvanceCommitIndexIfLogged(i)
-       \/ \E i,j \in Server : \E b,e \in matchIndex[i][j]+1..Len(log[i])+1 : AppendEntriesIfLogged(i, j, <<b,e>>)
+       \/ \E i,j \in Server : \E b,e \in matchIndex[i][j]+1..log[i].len+1 : AppendEntriesIfLogged(i, j, <<b,e>>)
        \/ \E i,j \in Server : HeartbeatIfLogged(i, j)
        \/ \E i,j \in Server : \E index \in 1..commitIndex[i] : SendSnapshotIfLogged(i, j, index)
        \/ \E i \in Server : TimeoutIfLogged(i)
        \/ \E i,j \in Server: AddNewServerIfLogged(i, j)
+       \/ \E i,j \in Server: AddLearnerIfLogged(i, j)
        \/ \E i,j \in Server: DeleteServerIfLogged(i, j)
        \/ \E i \in Server: ApplySimpleConfChangeInLeaderIfLogged(i)
        \/ \E i \in Server: ReadyIfLogged(i)

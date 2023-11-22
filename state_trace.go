@@ -2,6 +2,7 @@ package raft
 
 import (
 	"strconv"
+	"time"
 
 	"go.etcd.io/raft/v3/raftpb"
 	"go.etcd.io/raft/v3/tracker"
@@ -29,7 +30,6 @@ const (
 	RsmReceiveRequestVoteResponse
 	RsmSendSnapshot
 	RsmReceiveSnapshot
-	RsmReduceNextIndex
 )
 
 func (e RaftStateMachineEventType) String() string {
@@ -53,7 +53,6 @@ func (e RaftStateMachineEventType) String() string {
 		"ReceiveRequestVoteResponse",
 		"SendSnapshot",
 		"ReceiveSnapshot",
-		"ReduceNextIndex",
 	}[e]
 }
 
@@ -142,12 +141,12 @@ func makeTracingMessage(m *raftpb.Message) *TracingMessage {
 	}
 }
 
-type RaftStateMachineTracer interface {
-	TraceState(*TracingEvent)
+type TraceLogger interface {
+	TraceEvent(*TracingEvent)
 }
 
 func traceInitStateOnce(r *raft) {
-	if r.stateTracer == nil {
+	if r.traceLogger == nil {
 		return
 	}
 
@@ -161,7 +160,7 @@ func traceInitStateOnce(r *raft) {
 }
 
 func traceEvent(evt RaftStateMachineEventType, r *raft, m *raftpb.Message, prop map[string]any) {
-	if r.stateTracer == nil {
+	if r.traceLogger == nil {
 		return
 	}
 
@@ -169,7 +168,7 @@ func traceEvent(evt RaftStateMachineEventType, r *raft, m *raftpb.Message, prop 
 		return
 	}
 
-	r.stateTracer.TraceState(&TracingEvent{
+	r.traceLogger.TraceEvent(&TracingEvent{
 		Name:       evt.String(),
 		NodeID:     strconv.FormatUint(r.id, 10),
 		State:      makeTracingState(r),
@@ -211,13 +210,17 @@ func traceChangeConfEvent(cci raftpb.ConfChangeI, r *raft) {
 		}
 	}
 
+	if len(cc.Changes) == 0 {
+		return
+	}
+
 	p := map[string]any{}
 	p["cc"] = cc
 	traceEvent(RsmChangeConf, r, nil, p)
 }
 
 func traceConfChangeEvent(cfg tracker.Config, r *raft) {
-	if r.stateTracer == nil {
+	if r.traceLogger == nil {
 		return
 	}
 
@@ -232,17 +235,14 @@ func traceConfChangeEvent(cfg tracker.Config, r *raft) {
 }
 
 func traceSendMessage(r *raft, m *raftpb.Message) {
-	if r.stateTracer == nil {
+	if r.traceLogger == nil {
 		return
 	}
-
-	p := map[string]any{}
 
 	var evt RaftStateMachineEventType
 	switch m.Type {
 	case raftpb.MsgApp:
 		evt = RsmSendAppendEntriesRequest
-		p["advanceNextIndex"] = r.prs.Progress[m.To].State == tracker.StateReplicate
 	case raftpb.MsgHeartbeat, raftpb.MsgSnap:
 		evt = RsmSendAppendEntriesRequest
 	case raftpb.MsgAppResp, raftpb.MsgHeartbeatResp:
@@ -255,11 +255,11 @@ func traceSendMessage(r *raft, m *raftpb.Message) {
 		return
 	}
 
-	traceEvent(evt, r, m, p)
+	traceEvent(evt, r, m, nil)
 }
 
 func traceReceiveMessage(r *raft, m *raftpb.Message) {
-	if r.stateTracer == nil {
+	if r.traceLogger == nil {
 		return
 	}
 
@@ -277,18 +277,8 @@ func traceReceiveMessage(r *raft, m *raftpb.Message) {
 		return
 	}
 
+	time.Sleep(time.Millisecond) // sleep 1ms to reduce time shift impact accross node
 	traceEvent(evt, r, m, nil)
-}
-
-func traceReduceNextIndex(r *raft, peer uint64) {
-	if r.stateTracer == nil {
-		return
-	}
-
-	p := map[string]any{}
-	p["peer"] = strconv.FormatUint(peer, 10)
-	p["nextIndex"] = r.prs.Progress[peer].Next
-	traceEvent(RsmReduceNextIndex, r, nil, p)
 }
 
 func formatConf(s []uint64) []string {

@@ -285,7 +285,7 @@ type Config struct {
 	StepDownOnRemoval bool
 
 	// raft state tracer
-	StateTracer RaftStateMachineTracer
+	TraceLogger TraceLogger
 }
 
 func (c *Config) validate() error {
@@ -431,7 +431,7 @@ type raft struct {
 	// current term.
 	pendingReadIndexMessages []pb.Message
 
-	stateTracer     RaftStateMachineTracer
+	traceLogger     TraceLogger
 	initStateTraced bool
 }
 
@@ -462,7 +462,7 @@ func newRaft(c *Config) *raft {
 		disableProposalForwarding:   c.DisableProposalForwarding,
 		disableConfChangeValidation: c.DisableConfChangeValidation,
 		stepDownOnRemoval:           c.StepDownOnRemoval,
-		stateTracer:                 c.StateTracer,
+		traceLogger:                 c.TraceLogger,
 	}
 
 	cfg, prs, err := confchange.Restore(confchange.Changer{
@@ -1491,7 +1491,6 @@ func stepLeader(r *raft, m pb.Message) error {
 				if pr.State == tracker.StateReplicate {
 					pr.BecomeProbe()
 				}
-				traceReduceNextIndex(r, m.From)
 				r.sendAppend(m.From)
 			}
 		} else {
